@@ -44,7 +44,7 @@ jobs:
           set -euo pipefail
           test -n "$VPS_HOST"
           test -n "$VPS_USER"
-          test -n "${{ secrets.VPS_SSH_KEY }}"
+          test -n "${{ secrets.VPS_SSH_KEY_B64 }}"
 
       - name: Normalize SSH target values
         shell: bash
@@ -63,15 +63,18 @@ jobs:
           set -euo pipefail
           cargo build --release --locked -p darkwire-relay --bin darkwire-relay
 
-      - name: Configure SSH
+      - name: Setup SSH
+        env:
+          VPS_SSH_KEY_B64: ${{ secrets.VPS_SSH_KEY_B64 }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" | tr -d '\r' > ~/.ssh/id_ed25519
+          echo "$VPS_SSH_KEY_B64" | base64 -d > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+          ssh-keygen -lf ~/.ssh/id_ed25519
 
       - name: Verify SSH connectivity and deploy path
         shell: bash
@@ -85,7 +88,7 @@ jobs:
             -o ConnectTimeout=15 \
             "${VPS_USER}@${VPS_HOST}" \
             "echo ssh_ok=yes && test -d '${REMOTE_BIN%/*}'" || {
-              echo "::error::SSH verification failed. Check VPS_HOST, VPS_USER, VPS_SSH_KEY and that deploy key is in ~/.ssh/authorized_keys."
+              echo "::error::SSH verification failed. Check VPS_HOST, VPS_USER, VPS_SSH_KEY_B64 and that deploy key is in ~/.ssh/authorized_keys."
               exit 1
             }
 
@@ -101,7 +104,7 @@ jobs:
             -o ConnectTimeout=15 \
             target/release/darkwire-relay \
             "${VPS_USER}@${VPS_HOST}:${REMOTE_BIN}" || {
-              echo "::error::SCP upload failed. Verify VPS_HOST, VPS_USER, VPS_SSH_KEY and write access to ${REMOTE_BIN%/*}."
+              echo "::error::SCP upload failed. Verify VPS_HOST, VPS_USER, VPS_SSH_KEY_B64 and write access to ${REMOTE_BIN%/*}."
               exit 1
             }
 
