@@ -22,6 +22,7 @@ jobs:
       VPS_HOST: ${{ secrets.VPS_HOST }}
       VPS_USER: ${{ secrets.VPS_USER }}
       REMOTE_BIN: /opt/darkwire/bin/darkwire-relay
+      REMOTE_TMP: /opt/darkwire/bin/darkwire-relay.next
 
     steps:
       - name: Checkout repository
@@ -106,10 +107,10 @@ jobs:
             -o BatchMode=yes \
             -o ConnectTimeout=15 \
             target/release/darkwire-relay \
-            "${VPS_USER}@${VPS_HOST}:${REMOTE_BIN}"; then
+            "${VPS_USER}@${VPS_HOST}:${REMOTE_TMP}"; then
             echo "upload_method=scp"
           else
-            echo "::warning::SCP upload failed, retrying via SSH stream copy."
+            echo "::warning::SCP upload failed, retrying via SSH stream copy to ${REMOTE_TMP}."
             ssh \
               -i ~/.ssh/id_ed25519 \
               -o IdentitiesOnly=yes \
@@ -117,7 +118,7 @@ jobs:
               -o BatchMode=yes \
               -o ConnectTimeout=15 \
               "${VPS_USER}@${VPS_HOST}" \
-              "cat > '${REMOTE_BIN}'" < target/release/darkwire-relay
+              "cat > '${REMOTE_TMP}'" < target/release/darkwire-relay
             echo "upload_method=ssh_stream"
           fi
 
@@ -128,7 +129,7 @@ jobs:
             -o BatchMode=yes \
             -o ConnectTimeout=15 \
             "${VPS_USER}@${VPS_HOST}" \
-            "test -s '${REMOTE_BIN}' && ls -lh '${REMOTE_BIN}'"
+            "test -s '${REMOTE_TMP}' && ls -lh '${REMOTE_TMP}'"
 
       - name: Restart darkwire-relay service
         shell: bash
@@ -141,4 +142,4 @@ jobs:
             -o BatchMode=yes \
             -o ConnectTimeout=15 \
             "${VPS_USER}@${VPS_HOST}" \
-            "sudo chmod +x '${REMOTE_BIN}' && sudo systemctl restart darkwire-relay && sudo systemctl status darkwire-relay --no-pager"
+            "chmod +x '${REMOTE_TMP}' && mv -f '${REMOTE_TMP}' '${REMOTE_BIN}' && sudo /bin/chmod +x '${REMOTE_BIN}' && sudo /usr/bin/systemctl restart darkwire-relay && sudo /usr/bin/systemctl status darkwire-relay --no-pager"
