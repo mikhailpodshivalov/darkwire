@@ -545,6 +545,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invite_use_rejects_expired_invite() {
+        let state = AppState::new(LimitsConfig::default());
+
+        let (tx_a, _rx_a) = channel();
+        let (tx_b, _rx_b) = channel();
+        let inviter = state.register_connection(test_ip(10), tx_a).await;
+        let joiner = state.register_connection(test_ip(11), tx_b).await;
+
+        let created = state
+            .create_invite(
+                inviter,
+                test_ip(10),
+                InviteCreateRequest {
+                    r: vec!["ws://127.0.0.1:7000".to_string()],
+                    e: 1,
+                    o: true,
+                },
+            )
+            .await
+            .expect("invite create should pass");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let err = state
+            .use_invite(
+                joiner,
+                test_ip(11),
+                InviteUseRequest {
+                    invite: created.invite,
+                },
+            )
+            .await
+            .expect_err("expired invite should fail");
+        assert_eq!(err, InviteUseError::InviteExpired);
+    }
+
+    #[tokio::test]
     async fn route_message_enforces_active_session_and_rate_limit() {
         let mut limits = LimitsConfig::default();
         limits.msg_per_sec = 1;
@@ -597,6 +634,49 @@ mod tests {
             .route_message(inviter, "ok".len())
             .await
             .expect("message should pass after interval");
+    }
+
+    #[tokio::test]
+    async fn route_message_rejects_oversized_payload() {
+        let mut limits = LimitsConfig::default();
+        limits.max_msg_bytes = 8;
+
+        let state = AppState::new(limits);
+        let (tx_a, _rx_a) = channel();
+        let (tx_b, _rx_b) = channel();
+
+        let inviter = state.register_connection(test_ip(8), tx_a).await;
+        let joiner = state.register_connection(test_ip(9), tx_b).await;
+
+        let created = state
+            .create_invite(
+                inviter,
+                test_ip(8),
+                InviteCreateRequest {
+                    r: vec!["ws://127.0.0.1:7000".to_string()],
+                    e: 600,
+                    o: true,
+                },
+            )
+            .await
+            .expect("invite create should pass");
+
+        state
+            .use_invite(
+                joiner,
+                test_ip(9),
+                InviteUseRequest {
+                    invite: created.invite,
+                },
+            )
+            .await
+            .expect("invite use should pass");
+
+        let err = state
+            .route_message(inviter, 9)
+            .await
+            .expect_err("payload over max bytes should fail");
+        assert_eq!(err, MsgSendError::MessageTooLarge);
     }
 
     #[tokio::test]
