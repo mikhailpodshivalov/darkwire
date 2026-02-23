@@ -1,0 +1,6 @@
+# Replace relay.example.com with a public DNS name pointing to this server.
+# Caddy will automatically provision and renew TLS certificates.
+relay.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:7000
+}

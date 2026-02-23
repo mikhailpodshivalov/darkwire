@@ -92,3 +92,17 @@ The script runs workspace checks and key relay integration tests.
 ## Transport notes
 - Use `ws://` for local dev.
 - Use `wss://` via reverse proxy (nginx/caddy) in deployment.
+
+## Production WSS (Caddy)
+1. Point a public DNS record (for example `relay.example.com`) to your VPS IP.
+2. Install Caddy config from `deploy/caddy/Caddyfile.example` and replace host with your real domain.
+3. Validate and reload Caddy:
+```bash
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+sudo systemctl status caddy --no-pager
+```
+4. Use secure relay URL in client:
+```bash
+cargo run -p darkwire-client --bin darkwire -- --relay wss://relay.example.com/ws
+```
