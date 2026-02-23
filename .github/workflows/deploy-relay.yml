@@ -1,0 +1,86 @@
+name: Deploy Relay
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-relay-production
+  cancel-in-progress: false
+
+jobs:
+  deploy-relay:
+    name: Build and Deploy darkwire-relay
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      REMOTE_BIN: /opt/darkwire/bin/darkwire-relay
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          profile: minimal
+
+      - name: Cache Rust dependencies and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Validate deployment secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VPS_HOST"
+          test -n "$VPS_USER"
+          test -n "${{ secrets.VPS_SSH_KEY }}"
+
+      - name: Build darkwire-relay (release)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p darkwire-relay --bin darkwire-relay
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload relay binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          scp \
+            -i ~/.ssh/id_ed25519 \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            target/release/darkwire-relay \
+            "${VPS_USER}@${VPS_HOST}:${REMOTE_BIN}"
+
+      - name: Restart darkwire-relay service
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh \
+            -i ~/.ssh/id_ed25519 \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "${VPS_USER}@${VPS_HOST}" \
+            "sudo chmod +x '${REMOTE_BIN}' && sudo systemctl restart darkwire-relay && sudo systemctl status darkwire-relay --no-pager"
