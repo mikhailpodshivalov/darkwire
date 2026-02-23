@@ -1,6 +1,7 @@
 use crate::app_state::{
     ConnId, InviteCreateError, InviteUseError, MsgSendError, SessionTermination, SharedState,
 };
+use crate::logging;
 use axum::{
     extract::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
@@ -161,9 +162,19 @@ async fn handle_text_message(
     ip: IpAddr,
     raw: &str,
 ) -> bool {
+    let payload_bytes = raw.len();
     let incoming = match parse_incoming_envelope(raw) {
-        Some(incoming) => incoming,
+        Some(incoming) => {
+            logging::log_inbound_event(
+                conn_id,
+                &incoming.event_type,
+                incoming.request_id.as_deref(),
+                payload_bytes,
+            );
+            incoming
+        }
         None => {
+            logging::log_invalid_json(conn_id, payload_bytes);
             return send_error(
                 socket,
                 None,
