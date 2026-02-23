@@ -1,4 +1,6 @@
 mod app_state;
+mod invite_store;
+mod rate_limit;
 mod ws_handler;
 
 use app_state::AppState;

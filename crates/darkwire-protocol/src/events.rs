@@ -10,6 +10,7 @@ pub mod names {
 
     pub const READY: &str = "ready";
     pub const INVITE_CREATED: &str = "invite.created";
+    pub const INVITE_USED: &str = "invite.used";
     pub const SESSION_STARTED: &str = "session.started";
     pub const MSG_RECV: &str = "msg.recv";
     pub const SESSION_ENDED: &str = "session.ended";
@@ -76,6 +77,9 @@ pub struct InviteCreatedEvent {
     pub invite: String,
     pub expires_in: u32,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct InviteUsedEvent {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionStartedEvent {
