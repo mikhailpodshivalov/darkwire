@@ -72,9 +72,32 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
-          echo "$VPS_SSH_KEY_B64" | base64 -d > ~/.ssh/id_ed25519
+          chmod 700 ~/.ssh
+          printf '%s' "$VPS_SSH_KEY_B64" | tr -d '\r\n' | base64 --decode > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+          : > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+          keyscan_ok=false
+          for attempt in 1 2 3; do
+            if ssh-keyscan -T 5 -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null; then
+              keyscan_ok=true
+              break
+            fi
+            echo "::warning::ssh-keyscan failed on attempt ${attempt}, retrying..."
+            sleep 2
+          done
+
+          if [[ "$keyscan_ok" != "true" ]]; then
+            echo "::error::ssh-keyscan failed after 3 attempts for host $VPS_HOST"
+            exit 1
+          fi
+
+          if ! test -s ~/.ssh/known_hosts; then
+            echo "::error::known_hosts is empty after ssh-keyscan for host $VPS_HOST"
+            exit 1
+          fi
+
           ssh-keygen -lf ~/.ssh/id_ed25519
 
       - name: Verify SSH connectivity and deploy path
