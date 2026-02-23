@@ -60,6 +60,19 @@ or directly:
 darkwire --relay wss://srv1418428.hstgr.cloud/ws
 ```
 
+## Prebuilt client binaries for friends
+Use GitHub Actions matrix build to get client binaries for different OS targets.
+
+1. Open GitHub Actions and run workflow `Build Client Binaries`.
+2. Wait for all matrix jobs to finish.
+3. Download artifacts:
+   - `darkwire-linux-x64`
+   - `darkwire-windows-x64` (`darkwire.exe`)
+   - `darkwire-macos-arm64`
+4. Send the correct binary to each friend:
+   - Windows: `darkwire.exe --relay wss://srv1418428.hstgr.cloud/ws`
+   - macOS ARM/Linux: `chmod +x ./darkwire && ./darkwire --relay wss://srv1418428.hstgr.cloud/ws`
+
 ## Quickstart
 ### 1. Run relay
 ```bash
