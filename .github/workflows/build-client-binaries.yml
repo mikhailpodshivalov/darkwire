@@ -1,0 +1,72 @@
+name: Build Client Binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "client-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: client-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-client:
+    name: Build darkwire (${{ matrix.artifact_name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: darkwire-linux-x64
+            binary_path: target/x86_64-unknown-linux-gnu/release/darkwire
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: darkwire-windows-x64
+            binary_path: target/x86_64-pc-windows-msvc/release/darkwire.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: darkwire-macos-arm64
+            binary_path: target/aarch64-apple-darwin/release/darkwire
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust dependencies and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build darkwire client (release)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p darkwire-client --bin darkwire --target "${{ matrix.target }}"
+
+      - name: Verify binary exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "${{ matrix.binary_path }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.binary_path }}
+          if-no-files-found: error
+          retention-days: 14
