@@ -96,17 +96,39 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          scp \
+          test -f target/release/darkwire-relay
+          ls -lh target/release/darkwire-relay
+
+          if scp \
             -i ~/.ssh/id_ed25519 \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             -o BatchMode=yes \
             -o ConnectTimeout=15 \
             target/release/darkwire-relay \
-            "${VPS_USER}@${VPS_HOST}:${REMOTE_BIN}" || {
-              echo "::error::SCP upload failed. Verify VPS_HOST, VPS_USER, VPS_SSH_KEY_B64 and write access to ${REMOTE_BIN%/*}."
-              exit 1
-            }
+            "${VPS_USER}@${VPS_HOST}:${REMOTE_BIN}"; then
+            echo "upload_method=scp"
+          else
+            echo "::warning::SCP upload failed, retrying via SSH stream copy."
+            ssh \
+              -i ~/.ssh/id_ed25519 \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              -o BatchMode=yes \
+              -o ConnectTimeout=15 \
+              "${VPS_USER}@${VPS_HOST}" \
+              "cat > '${REMOTE_BIN}'" < target/release/darkwire-relay
+            echo "upload_method=ssh_stream"
+          fi
+
+          ssh \
+            -i ~/.ssh/id_ed25519 \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            "${VPS_USER}@${VPS_HOST}" \
+            "test -s '${REMOTE_BIN}' && ls -lh '${REMOTE_BIN}'"
 
       - name: Restart darkwire-relay service
         shell: bash
