@@ -49,15 +49,23 @@ darkwire-relay --listen 127.0.0.1:7000
 
 ### 3. Start client
 ```bash
-./scripts/start-client.sh --relay wss://srv1418428.hstgr.cloud/ws
+./scripts/start-client.sh
 ```
 or (custom install dir):
 ```bash
-DARKWIRE_INSTALL_DIR=/tmp/darkwire-bin ./scripts/start-client.sh --relay wss://srv1418428.hstgr.cloud/ws
+DARKWIRE_INSTALL_DIR=/tmp/darkwire-bin ./scripts/start-client.sh
 ```
 or directly:
 ```bash
-darkwire --relay wss://srv1418428.hstgr.cloud/ws
+darkwire
+```
+Override relay when needed:
+```bash
+darkwire --relay ws://127.0.0.1:7000/ws
+```
+or:
+```bash
+DARKWIRE_RELAY_WS=ws://127.0.0.1:7000/ws darkwire
 ```
 
 ## Prebuilt client binaries for friends
@@ -70,8 +78,8 @@ Use GitHub Actions matrix build to get client binaries for different OS targets.
    - `darkwire-windows-x64` (`darkwire.exe`)
    - `darkwire-macos-arm64`
 4. Send the correct binary to each friend:
-   - Windows: `darkwire.exe --relay wss://srv1418428.hstgr.cloud/ws`
-   - macOS ARM/Linux: `chmod +x ./darkwire && ./darkwire --relay wss://srv1418428.hstgr.cloud/ws`
+   - Windows: `darkwire.exe`
+   - macOS ARM/Linux: `chmod +x ./darkwire && ./darkwire`
 
 ## Quickstart
 ### 1. Run relay
@@ -114,7 +122,7 @@ After `session.started` on both sides, type text lines to chat.
 - `--log-filter <filter>` (`DARKWIRE_LOG_FILTER`), default `darkwire_relay=info,tower_http=warn`
 
 ### Client (`darkwire`)
-- `--relay <ws://.../ws>` (`DARKWIRE_RELAY_WS`), default `ws://127.0.0.1:7000/ws`
+- `--relay <ws://.../ws|wss://.../ws>` (`DARKWIRE_RELAY_WS`), default `wss://srv1418428.hstgr.cloud/ws`
 - `--invite-relay <ws://.../ws>` (`DARKWIRE_INVITE_RELAY`), default = value of `--relay`
 - `--invite-ttl <seconds>` (`DARKWIRE_INVITE_TTL`), default `600` (range `1..=86400`)
 
