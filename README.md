@@ -20,6 +20,46 @@ Implemented phases 1-7:
 - Rust 1.76+
 - Cargo
 
+## Easy install (no cargo run every time)
+### 1. Install binaries once
+```bash
+./scripts/install.sh
+```
+If needed, set custom destination:
+```bash
+./scripts/install.sh --install-dir /tmp/darkwire-bin
+```
+
+This installs:
+- `darkwire` to `~/.local/bin/darkwire`
+- `darkwire-relay` to `~/.local/bin/darkwire-relay`
+
+### 2. Start relay
+```bash
+./scripts/start-relay.sh
+```
+or (custom install dir):
+```bash
+DARKWIRE_INSTALL_DIR=/tmp/darkwire-bin ./scripts/start-relay.sh
+```
+or directly:
+```bash
+darkwire-relay --listen 127.0.0.1:7000
+```
+
+### 3. Start client
+```bash
+./scripts/start-client.sh --relay wss://srv1418428.hstgr.cloud/ws
+```
+or (custom install dir):
+```bash
+DARKWIRE_INSTALL_DIR=/tmp/darkwire-bin ./scripts/start-client.sh --relay wss://srv1418428.hstgr.cloud/ws
+```
+or directly:
+```bash
+darkwire --relay wss://srv1418428.hstgr.cloud/ws
+```
+
 ## Quickstart
 ### 1. Run relay
 ```bash
