@@ -5,8 +5,13 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "darkwire-relay"
+path = "src/main.rs"
+
 [dependencies]
 axum.workspace = true
+clap.workspace = true
 darkwire-protocol = { path = "../darkwire-protocol" }
 futures-util.workspace = true
 serde.workspace = true
