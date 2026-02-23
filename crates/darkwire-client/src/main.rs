@@ -58,6 +58,8 @@ enum UserCommand {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider();
+
     let args = ClientArgs::parse();
     let relay_ws = args.relay.clone();
     let invite_relay = resolve_invite_relay(&args);
@@ -125,6 +127,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let _ = ws_writer.send(Message::Close(None)).await;
     Ok(())
+}
+
+fn install_rustls_crypto_provider() {
+    // rustls 0.23 requires selecting a process-level provider before TLS handshakes.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 async fn handle_user_input(
