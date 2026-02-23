@@ -46,6 +46,17 @@ jobs:
           test -n "$VPS_USER"
           test -n "${{ secrets.VPS_SSH_KEY }}"
 
+      - name: Normalize SSH target values
+        shell: bash
+        run: |
+          set -euo pipefail
+          clean_host="$(printf '%s' "$VPS_HOST" | tr -d '\r\n')"
+          clean_user="$(printf '%s' "$VPS_USER" | tr -d '\r\n')"
+          test -n "$clean_host"
+          test -n "$clean_user"
+          echo "VPS_HOST=$clean_host" >> "$GITHUB_ENV"
+          echo "VPS_USER=$clean_user" >> "$GITHUB_ENV"
+
       - name: Build darkwire-relay (release)
         shell: bash
         run: |
@@ -73,7 +84,10 @@ jobs:
             -o BatchMode=yes \
             -o ConnectTimeout=15 \
             "${VPS_USER}@${VPS_HOST}" \
-            "test -d '${REMOTE_BIN%/*}' && test -w '${REMOTE_BIN%/*}'"
+            "echo ssh_ok=yes && test -d '${REMOTE_BIN%/*}'" || {
+              echo "::error::SSH verification failed. Check VPS_HOST, VPS_USER, VPS_SSH_KEY and that deploy key is in ~/.ssh/authorized_keys."
+              exit 1
+            }
 
       - name: Upload relay binary
         shell: bash
