@@ -10,7 +10,7 @@ use std::error::Error;
 use tokio::{io::AsyncBufReadExt, io::BufReader, net::TcpStream};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-const DEFAULT_RELAY_WS: &str = "ws://127.0.0.1:7000/ws";
+const DEFAULT_RELAY_WS: &str = "wss://srv1418428.hstgr.cloud/ws";
 const DEFAULT_INVITE_TTL: u32 = 10 * 60;
 
 type WsWriter = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;

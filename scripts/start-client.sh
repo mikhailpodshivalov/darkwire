@@ -12,7 +12,7 @@ else
   exit 1
 fi
 
-DEFAULT_RELAY="${DARKWIRE_RELAY_WS:-ws://127.0.0.1:7000/ws}"
+DEFAULT_RELAY="${DARKWIRE_RELAY_WS:-wss://srv1418428.hstgr.cloud/ws}"
 HAS_RELAY_FLAG=false
 
 for arg in "$@"; do
