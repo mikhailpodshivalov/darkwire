@@ -1,3 +1,4 @@
+use clap::Parser;
 use darkwire_protocol::events::{
     self, Envelope, ErrorEvent, InviteCreateRequest, InviteCreatedEvent, InviteUseRequest,
     MsgRecvEvent, MsgSendRequest, RateLimitedEvent, ReadyEvent, SessionEndReason,
@@ -5,7 +6,7 @@ use darkwire_protocol::events::{
 };
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::{env, error::Error};
+use std::error::Error;
 use tokio::{io::AsyncBufReadExt, io::BufReader, net::TcpStream};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
@@ -13,6 +14,22 @@ const DEFAULT_RELAY_WS: &str = "ws://127.0.0.1:7000/ws";
 const DEFAULT_INVITE_TTL: u32 = 10 * 60;
 
 type WsWriter = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+
+#[derive(Debug, Parser)]
+#[command(name = "darkwire", version, about = "Darkwire terminal chat client")]
+struct ClientArgs {
+    #[arg(long, env = "DARKWIRE_RELAY_WS", default_value = DEFAULT_RELAY_WS)]
+    relay: String,
+    #[arg(long, env = "DARKWIRE_INVITE_RELAY")]
+    invite_relay: Option<String>,
+    #[arg(
+        long,
+        env = "DARKWIRE_INVITE_TTL",
+        default_value_t = DEFAULT_INVITE_TTL,
+        value_parser = clap::value_parser!(u32).range(1..=86_400)
+    )]
+    invite_ttl: u32,
+}
 
 #[derive(Debug, Default)]
 struct ClientState {
@@ -41,8 +58,10 @@ enum UserCommand {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let relay_ws = env::var("DARKWIRE_RELAY_WS").unwrap_or_else(|_| DEFAULT_RELAY_WS.to_string());
-    let invite_relay = env::var("DARKWIRE_INVITE_RELAY").unwrap_or_else(|_| relay_ws.clone());
+    let args = ClientArgs::parse();
+    let relay_ws = args.relay.clone();
+    let invite_relay = resolve_invite_relay(&args);
+    let invite_ttl = args.invite_ttl;
 
     println!("Connecting to {relay_ws} ...");
     let (ws_stream, _) = connect_async(relay_ws.as_str()).await?;
@@ -66,6 +85,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     &mut ws_writer,
                     &mut state,
                     &invite_relay,
+                    invite_ttl,
                     &mut request_counter,
                 ).await?;
 
@@ -112,6 +132,7 @@ async fn handle_user_input(
     ws_writer: &mut WsWriter,
     state: &mut ClientState,
     invite_relay: &str,
+    invite_ttl: u32,
     request_counter: &mut u64,
 ) -> Result<bool, Box<dyn Error>> {
     match parse_user_command(line) {
@@ -136,7 +157,7 @@ async fn handle_user_input(
         UserCommand::CreateInvite => {
             let payload = InviteCreateRequest {
                 r: vec![invite_relay.to_string()],
-                e: DEFAULT_INVITE_TTL,
+                e: invite_ttl,
                 o: true,
             };
 
@@ -301,6 +322,12 @@ fn session_end_reason_name(reason: SessionEndReason) -> &'static str {
     }
 }
 
+fn resolve_invite_relay(args: &ClientArgs) -> String {
+    args.invite_relay
+        .clone()
+        .unwrap_or_else(|| args.relay.clone())
+}
+
 fn rate_limit_scope_name(scope: darkwire_protocol::events::RateLimitScope) -> &'static str {
     match scope {
         darkwire_protocol::events::RateLimitScope::InviteCreate => "invite_create",
@@ -342,5 +369,31 @@ mod tests {
     #[test]
     fn parse_command_unknown_for_bad_connect() {
         assert_eq!(parse_user_command("/c"), UserCommand::Unknown);
+    }
+
+    #[test]
+    fn cli_defaults_match_contract() {
+        let args = ClientArgs::parse_from(["darkwire"]);
+        assert_eq!(args.relay, DEFAULT_RELAY_WS);
+        assert_eq!(args.invite_relay, None);
+        assert_eq!(args.invite_ttl, DEFAULT_INVITE_TTL);
+    }
+
+    #[test]
+    fn invite_relay_falls_back_to_relay_when_not_set() {
+        let args = ClientArgs::parse_from(["darkwire", "--relay", "ws://127.0.0.1:7777/ws"]);
+        assert_eq!(resolve_invite_relay(&args), "ws://127.0.0.1:7777/ws");
+    }
+
+    #[test]
+    fn invite_relay_uses_explicit_value_when_set() {
+        let args = ClientArgs::parse_from([
+            "darkwire",
+            "--relay",
+            "ws://127.0.0.1:7777/ws",
+            "--invite-relay",
+            "ws://127.0.0.1:8888/ws",
+        ]);
+        assert_eq!(resolve_invite_relay(&args), "ws://127.0.0.1:8888/ws");
     }
 }

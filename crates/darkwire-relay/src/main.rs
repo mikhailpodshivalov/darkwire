@@ -7,16 +7,31 @@ mod ws_handler;
 
 use app_state::AppState;
 use axum::{routing::get, Router};
+use clap::Parser;
 use darkwire_protocol::config::LimitsConfig;
-use std::{env, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[derive(Debug, Clone, Parser)]
+#[command(name = "darkwire-relay", version, about = "Darkwire websocket relay")]
+struct RelayArgs {
+    #[arg(long, env = "DARKWIRE_RELAY_ADDR", default_value = "127.0.0.1:7000")]
+    listen: SocketAddr,
+    #[arg(
+        long,
+        env = "DARKWIRE_LOG_FILTER",
+        default_value = "darkwire_relay=info,tower_http=warn"
+    )]
+    log_filter: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing();
+    let args = RelayArgs::parse();
+    init_tracing(&args.log_filter);
 
-    let bind_addr = relay_addr_from_env();
+    let bind_addr = args.listen;
     let limits = LimitsConfig::default();
     let state = Arc::new(AppState::new(limits.clone()));
 
@@ -40,29 +55,9 @@ fn build_app(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-fn relay_addr_from_env() -> SocketAddr {
-    let env_value = env::var("DARKWIRE_RELAY_ADDR").ok();
-    relay_addr_from_value(env_value.as_deref())
-}
-
-fn relay_addr_from_value(value: Option<&str>) -> SocketAddr {
-    const DEFAULT_ADDR: &str = "127.0.0.1:7000";
-
-    value
-        .and_then(|raw| raw.parse::<SocketAddr>().ok())
-        .unwrap_or_else(|| {
-            DEFAULT_ADDR
-                .parse()
-                .expect("default relay address is valid")
-        })
-}
-
-fn init_tracing() {
+fn init_tracing(log_filter: &str) {
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "darkwire_relay=info,tower_http=warn".into()),
-        )
+        .with(tracing_subscriber::EnvFilter::new(log_filter.to_string()))
         .with(tracing_subscriber::fmt::layer())
         .init();
 }
@@ -98,21 +93,28 @@ mod tests {
     }
 
     #[test]
-    fn relay_addr_defaults_when_value_missing() {
-        let addr = relay_addr_from_value(None);
+    fn relay_addr_defaults_when_not_provided() {
+        let addr = RelayArgs::parse_from(["darkwire-relay"]).listen;
         assert_eq!(addr.to_string(), "127.0.0.1:7000");
     }
 
     #[test]
-    fn relay_addr_uses_value_when_valid() {
-        let addr = relay_addr_from_value(Some("127.0.0.1:7011"));
+    fn relay_addr_uses_listen_flag() {
+        let addr = RelayArgs::parse_from(["darkwire-relay", "--listen", "127.0.0.1:7011"]).listen;
         assert_eq!(addr.to_string(), "127.0.0.1:7011");
     }
 
     #[test]
-    fn relay_addr_falls_back_for_invalid_value() {
-        let addr = relay_addr_from_value(Some("invalid-addr"));
-        assert_eq!(addr.to_string(), "127.0.0.1:7000");
+    fn relay_log_filter_defaults_when_not_provided() {
+        let filter = RelayArgs::parse_from(["darkwire-relay"]).log_filter;
+        assert_eq!(filter, "darkwire_relay=info,tower_http=warn");
+    }
+
+    #[test]
+    fn relay_log_filter_uses_flag_value() {
+        let filter =
+            RelayArgs::parse_from(["darkwire-relay", "--log-filter", "debug,axum=warn"]).log_filter;
+        assert_eq!(filter, "debug,axum=warn");
     }
 
     #[tokio::test]
