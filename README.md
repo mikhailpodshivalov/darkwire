@@ -81,6 +81,15 @@ Use GitHub Actions matrix build to get client binaries for different OS targets.
    - Windows: `darkwire.exe`
    - macOS ARM/Linux: `chmod +x ./darkwire && ./darkwire`
 
+### Publish binaries to GitHub Release
+1. Push a tag `client-v*` (example: `client-v20260223-02`).
+2. Workflow `Build Client Binaries` runs matrix build and then publishes release assets.
+3. In release page you get:
+   - `darkwire-linux-x64`
+   - `darkwire-windows-x64.exe`
+   - `darkwire-macos-arm64`
+   - `SHA256SUMS.txt`
+
 ## Quickstart
 ### 1. Run relay
 ```bash
