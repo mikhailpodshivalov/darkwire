@@ -1,4 +1,6 @@
-use crate::app_state::{ConnId, InviteCreateError, InviteUseError, SharedState};
+use crate::app_state::{
+    ConnId, InviteCreateError, InviteUseError, MsgSendError, SessionTermination, SharedState,
+};
 use axum::{
     extract::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
@@ -8,15 +10,22 @@ use axum::{
 };
 use darkwire_protocol::events::{
     self, Envelope, ErrorCode, ErrorEvent, InviteCreateRequest, InviteCreatedEvent,
-    InviteUseRequest, InviteUsedEvent, PongEvent, RateLimitScope, RateLimitedEvent, ReadyEvent,
+    InviteUseRequest, InviteUsedEvent, MsgRecvEvent, MsgSendRequest, PongEvent, RateLimitScope,
+    RateLimitedEvent, ReadyEvent, SessionEndReason, SessionEndedEvent, SessionLeaveRequest,
+    SessionStartedEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, SocketAddr},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::time::{self, MissedTickBehavior};
+use tokio::{
+    sync::mpsc,
+    time::{self, MissedTickBehavior},
+};
 use tracing::{debug, info, warn};
+
+const OUTBOUND_BUFFER: usize = 64;
 
 pub async fn ws_upgrade(
     State(state): State<SharedState>,
@@ -28,15 +37,19 @@ pub async fn ws_upgrade(
 }
 
 async fn handle_socket(mut socket: WebSocket, state: SharedState, ip: IpAddr) {
-    let conn_id = state.register_connection(ip).await;
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(OUTBOUND_BUFFER);
+    let conn_id = state.register_connection(ip, outbound_tx).await;
     info!(%conn_id, %ip, "connection.opened");
 
     if let Err(err) = send_ready(&mut socket).await {
         warn!(%conn_id, %ip, err = %err, "connection.ready_send_failed");
-        state.unregister_connection(conn_id).await;
+        state
+            .unregister_connection(conn_id, SessionEndReason::PeerDisconnect)
+            .await;
         return;
     }
 
+    let mut disconnect_reason = SessionEndReason::PeerDisconnect;
     let idle_timeout = state.limits().idle_timeout();
     let mut idle_tick = time::interval(Duration::from_secs(5));
     idle_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -50,6 +63,7 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState, ip: IpAddr) {
                 };
 
                 if snapshot.last_activity.elapsed() >= idle_timeout {
+                    disconnect_reason = SessionEndReason::IdleTimeout;
                     info!(
                         %conn_id,
                         ip = %snapshot.ip,
@@ -64,6 +78,17 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState, ip: IpAddr) {
                         })))
                         .await;
                     break;
+                }
+            }
+            outbound = outbound_rx.recv() => {
+                match outbound {
+                    Some(payload) => {
+                        if let Err(err) = socket.send(Message::Text(payload.into())).await {
+                            warn!(%conn_id, err = %err, "connection.outbound_send_failed");
+                            break;
+                        }
+                    }
+                    None => break,
                 }
             }
             frame = socket.recv() => {
@@ -83,10 +108,16 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState, ip: IpAddr) {
         }
     }
 
-    let removed = state.unregister_connection(conn_id).await;
+    let outcome = state
+        .unregister_connection(conn_id, disconnect_reason.clone())
+        .await;
     let total = state.active_connection_count().await;
 
-    if let Some(removed) = removed {
+    if let Some(peer_ended) = outcome.peer_ended {
+        let _ = queue_session_ended(&state, peer_ended).await;
+    }
+
+    if let Some(removed) = outcome.connection {
         info!(
             conn_id = %removed.id,
             ip = %removed.ip,
@@ -185,6 +216,16 @@ async fn handle_text_message(
                     )
                     .await
                 }
+                Err(InviteCreateError::PeerOffline) => {
+                    send_error(
+                        socket,
+                        request_id,
+                        ErrorCode::BadRequest,
+                        "connection is offline",
+                        conn_id,
+                    )
+                    .await
+                }
             }
         }
         events::names::INVITE_USE => {
@@ -202,8 +243,46 @@ async fn handle_text_message(
                 }
             };
 
-            match state.use_invite(ip, request).await {
-                Ok(_) => send_invite_used(socket, request_id, conn_id).await,
+            match state.use_invite(conn_id, ip, request).await {
+                Ok(joined) => {
+                    if !send_invite_used(socket, request_id.clone(), conn_id).await {
+                        return false;
+                    }
+
+                    if !send_session_started(socket, request_id, joined.session_id, conn_id).await {
+                        return false;
+                    }
+
+                    let peer_started = encode_event(
+                        events::names::SESSION_STARTED,
+                        None,
+                        SessionStartedEvent {
+                            session_id: joined.session_id,
+                            peer: "anon".to_string(),
+                        },
+                    );
+
+                    if !state
+                        .send_to_connection(joined.creator_conn, peer_started)
+                        .await
+                    {
+                        if let Some(ended) = state
+                            .end_session_for_conn(conn_id, SessionEndReason::PeerDisconnect)
+                            .await
+                        {
+                            let _ = send_session_ended(
+                                socket,
+                                None,
+                                ended.session_id,
+                                SessionEndReason::PeerDisconnect,
+                                conn_id,
+                            )
+                            .await;
+                        }
+                    }
+
+                    true
+                }
                 Err(InviteUseError::RateLimited(hit)) => {
                     send_rate_limited(
                         socket,
@@ -244,6 +323,149 @@ async fn handle_text_message(
                     )
                     .await
                 }
+                Err(InviteUseError::PeerOffline) => {
+                    send_error(
+                        socket,
+                        request_id,
+                        ErrorCode::InvalidInvite,
+                        "invite peer is offline",
+                        conn_id,
+                    )
+                    .await
+                }
+                Err(InviteUseError::SessionBusy) => {
+                    send_error(
+                        socket,
+                        request_id,
+                        ErrorCode::BadRequest,
+                        "session already active",
+                        conn_id,
+                    )
+                    .await
+                }
+            }
+        }
+        events::names::MSG_SEND => {
+            let request: MsgSendRequest = match serde_json::from_value(incoming.data) {
+                Ok(request) => request,
+                Err(_) => {
+                    return send_error(
+                        socket,
+                        request_id,
+                        ErrorCode::BadRequest,
+                        "invalid msg.send payload",
+                        conn_id,
+                    )
+                    .await;
+                }
+            };
+
+            match state.route_message(conn_id, request.text.len()).await {
+                Ok(route) => {
+                    let payload = encode_event(
+                        events::names::MSG_RECV,
+                        None,
+                        MsgRecvEvent {
+                            session_id: route.session_id,
+                            text: request.text,
+                        },
+                    );
+
+                    if !state.send_to_connection(route.peer_conn, payload).await {
+                        if let Some(ended) = state
+                            .end_session_for_conn(conn_id, SessionEndReason::PeerDisconnect)
+                            .await
+                        {
+                            let _ = send_session_ended(
+                                socket,
+                                None,
+                                ended.session_id,
+                                SessionEndReason::PeerDisconnect,
+                                conn_id,
+                            )
+                            .await;
+                        }
+                    }
+
+                    true
+                }
+                Err(MsgSendError::NoActiveSession) => {
+                    send_error(
+                        socket,
+                        request_id,
+                        ErrorCode::NoActiveSession,
+                        "no active session",
+                        conn_id,
+                    )
+                    .await
+                }
+                Err(MsgSendError::MessageTooLarge) => {
+                    send_error(
+                        socket,
+                        request_id,
+                        ErrorCode::MessageTooLarge,
+                        "message exceeds max size",
+                        conn_id,
+                    )
+                    .await
+                }
+                Err(MsgSendError::RateLimited(retry_after)) => {
+                    send_rate_limited(
+                        socket,
+                        request_id,
+                        RateLimitScope::MsgSend,
+                        retry_after,
+                        conn_id,
+                    )
+                    .await
+                }
+            }
+        }
+        events::names::SESSION_LEAVE => {
+            let _: SessionLeaveRequest = match serde_json::from_value(incoming.data) {
+                Ok(request) => request,
+                Err(_) => {
+                    return send_error(
+                        socket,
+                        request_id,
+                        ErrorCode::BadRequest,
+                        "invalid session.leave payload",
+                        conn_id,
+                    )
+                    .await;
+                }
+            };
+
+            match state
+                .end_session_for_conn(conn_id, SessionEndReason::PeerQuit)
+                .await
+            {
+                Some(ended) => {
+                    if !send_session_ended(
+                        socket,
+                        request_id,
+                        ended.session_id,
+                        SessionEndReason::PeerQuit,
+                        conn_id,
+                    )
+                    .await
+                    {
+                        return false;
+                    }
+
+                    let _ = queue_session_ended(state, ended).await;
+                    true
+                }
+                None => {
+                    send_error(
+                        socket,
+                        request_id,
+                        ErrorCode::NoActiveSession,
+                        "no active session",
+                        conn_id,
+                    )
+                    .await
+                }
             }
         }
         _ => {
@@ -265,10 +487,15 @@ async fn send_ready(socket: &mut WebSocket) -> Result<(), axum::Error> {
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let ready = ReadyEvent {
-        server_time: now_unix,
-    };
-    send_event(socket, events::names::READY, None, ready).await
+    send_event(
+        socket,
+        events::names::READY,
+        None,
+        ReadyEvent {
+            server_time: now_unix,
+        },
+    )
+    .await
 }
 
 async fn send_pong(socket: &mut WebSocket, request_id: Option<String>, conn_id: ConnId) -> bool {
@@ -329,6 +556,57 @@ async fn send_invite_used(
     }
 }
 
+async fn send_session_started(
+    socket: &mut WebSocket,
+    request_id: Option<String>,
+    session_id: uuid::Uuid,
+    conn_id: ConnId,
+) -> bool {
+    let event = SessionStartedEvent {
+        session_id,
+        peer: "anon".to_string(),
+    };
+
+    match send_event(socket, events::names::SESSION_STARTED, request_id, event).await {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(%conn_id, err = %err, "connection.session_started_send_failed");
+            false
+        }
+    }
+}
+
+async fn queue_session_ended(state: &SharedState, ended: SessionTermination) -> bool {
+    let payload = encode_event(
+        events::names::SESSION_ENDED,
+        None,
+        SessionEndedEvent {
+            session_id: ended.session_id,
+            reason: ended.reason,
+        },
+    );
+
+    state.send_to_connection(ended.peer_conn, payload).await
+}
+
+async fn send_session_ended(
+    socket: &mut WebSocket,
+    request_id: Option<String>,
+    session_id: uuid::Uuid,
+    reason: SessionEndReason,
+    conn_id: ConnId,
+) -> bool {
+    let event = SessionEndedEvent { session_id, reason };
+
+    match send_event(socket, events::names::SESSION_ENDED, request_id, event).await {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(%conn_id, err = %err, "connection.session_ended_send_failed");
+            false
+        }
+    }
+}
+
 async fn send_rate_limited(
     socket: &mut WebSocket,
     request_id: Option<String>,
@@ -377,11 +655,15 @@ async fn send_event<T: Serialize>(
     request_id: Option<String>,
     data: T,
 ) -> Result<(), axum::Error> {
+    let raw = encode_event(event_type, request_id, data);
+    socket.send(Message::Text(raw.into())).await
+}
+
+fn encode_event<T: Serialize>(event_type: &str, request_id: Option<String>, data: T) -> String {
     let mut envelope = Envelope::new(event_type, data);
     envelope.request_id = request_id;
 
-    let raw = serde_json::to_string(&envelope).expect("serializing event should not fail");
-    socket.send(Message::Text(raw.into())).await
+    serde_json::to_string(&envelope).expect("serializing event should not fail")
 }
 
 fn duration_to_ms(duration: Duration) -> u64 {
@@ -427,5 +709,23 @@ mod tests {
     fn duration_to_ms_never_returns_zero() {
         assert_eq!(duration_to_ms(Duration::from_millis(0)), 1);
         assert_eq!(duration_to_ms(Duration::from_millis(7)), 7);
+    }
+
+    #[test]
+    fn encode_event_uses_wire_shape() {
+        let raw = encode_event(
+            events::names::ERROR,
+            Some("req-1".to_string()),
+            ErrorEvent {
+                code: ErrorCode::BadRequest,
+                message: "oops".to_string(),
+            },
+        );
+
+        let envelope: serde_json::Value =
+            serde_json::from_str(&raw).expect("encoded event must be valid JSON");
+        assert_eq!(envelope["t"], events::names::ERROR);
+        assert_eq!(envelope["rid"], "req-1");
+        assert_eq!(envelope["d"]["message"], "oops");
     }
 }

@@ -96,6 +96,15 @@ impl InviteStore {
         })
     }
 
+    pub async fn rollback_use(&self, token: &str) {
+        let mut invites = self.invites.write().await;
+        if let Some(record) = invites.get_mut(token) {
+            if record.one_time {
+                record.used = false;
+            }
+        }
+    }
+
     #[cfg(test)]
     pub async fn invite_count(&self) -> usize {
         self.invites.read().await.len()
