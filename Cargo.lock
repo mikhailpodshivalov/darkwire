@@ -150,6 +150,11 @@ name = "darkwire-client"
 version = "0.1.0"
 dependencies = [
  "darkwire-protocol",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
  "tracing",
 ]
 
