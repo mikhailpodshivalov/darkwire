@@ -26,14 +26,17 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: darkwire-linux-x64
             binary_path: target/x86_64-unknown-linux-gnu/release/darkwire
+            asset_name: darkwire-linux-x64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: darkwire-windows-x64
             binary_path: target/x86_64-pc-windows-msvc/release/darkwire.exe
+            asset_name: darkwire-windows-x64.exe
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: darkwire-macos-arm64
             binary_path: target/aarch64-apple-darwin/release/darkwire
+            asset_name: darkwire-macos-arm64
 
     steps:
       - name: Checkout repository
@@ -63,10 +66,68 @@ jobs:
           set -euo pipefail
           test -f "${{ matrix.binary_path }}"
 
+      - name: Prepare artifact file
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "${{ matrix.binary_path }}" "dist/${{ matrix.asset_name }}"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.binary_path }}
+          path: dist/${{ matrix.asset_name }}
           if-no-files-found: error
           retention-days: 14
+
+  publish-release:
+    name: Publish Release Assets
+    if: startsWith(github.ref, 'refs/tags/client-v')
+    needs:
+      - build-client
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify downloaded assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lah dist
+          test -f dist/darkwire-linux-x64
+          test -f dist/darkwire-windows-x64.exe
+          test -f dist/darkwire-macos-arm64
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum \
+              darkwire-linux-x64 \
+              darkwire-windows-x64.exe \
+              darkwire-macos-arm64 > SHA256SUMS.txt
+          )
+
+      - name: Create/Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Darkwire Client ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: |
+            dist/darkwire-linux-x64
+            dist/darkwire-windows-x64.exe
+            dist/darkwire-macos-arm64
+            dist/SHA256SUMS.txt
