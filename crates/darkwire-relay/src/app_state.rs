@@ -1,15 +1,19 @@
 use crate::{
     invite_store::{InviteConsumeError, InviteRecord, InviteStore},
+    prekey_store::{OpkRecord, PrekeyStore, SpkRecord},
     rate_limit::{RateLimitHit, RateLimitStore},
     session_store::{SessionCreateError, SessionId, SessionStore},
 };
 use darkwire_protocol::{
     config::LimitsConfig,
-    events::{InviteCreateRequest, InviteUseRequest, SessionEndReason},
+    events::{
+        InviteCreateRequest, InviteUseRequest, OneTimePrekey, PrekeyGetRequest,
+        PrekeyPublishRequest, PublicPrekeyBundle, SessionEndReason, SignedPrekey,
+    },
     invite::{decode_invite, encode_invite, InvitePayloadV1, INVITE_VERSION, TOKEN_MAX_LEN},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::IpAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -22,6 +26,7 @@ pub type SharedState = Arc<AppState>;
 pub type OutboundSender = mpsc::Sender<String>;
 
 const TOKEN_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+const MAX_OPKS_PER_PUBLISH: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct ConnectionRecord {
@@ -69,6 +74,39 @@ pub struct MessageRoute {
     pub peer_conn: ConnId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HandshakeFailureReason {
+    InvalidPayload,
+    NoActiveSession,
+    SessionMismatch,
+    PrekeyNotFound,
+    UnsupportedEvent,
+}
+
+impl HandshakeFailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HandshakeFailureReason::InvalidPayload => "invalid_payload",
+            HandshakeFailureReason::NoActiveSession => "no_active_session",
+            HandshakeFailureReason::SessionMismatch => "session_mismatch",
+            HandshakeFailureReason::PrekeyNotFound => "prekey_not_found",
+            HandshakeFailureReason::UnsupportedEvent => "unsupported_event",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrekeyPublished {
+    pub spk_id: u32,
+    pub opk_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrekeyBundleRoute {
+    pub session_id: SessionId,
+    pub peer: PublicPrekeyBundle,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InviteCreateError {
     RateLimited(RateLimitHit),
@@ -93,13 +131,30 @@ pub enum MsgSendError {
     RateLimited(Duration),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrekeyPublishError {
+    RateLimited(RateLimitHit),
+    PeerOffline,
+    InvalidRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrekeyGetError {
+    RateLimited(RateLimitHit),
+    NoActiveSession,
+    SessionMismatch,
+    PrekeyNotFound,
+}
+
 #[derive(Debug)]
 pub struct AppState {
     limits: LimitsConfig,
     connections: RwLock<HashMap<ConnId, ConnectionEntry>>,
     invites: InviteStore,
     rate_limits: RateLimitStore,
+    prekeys: RwLock<PrekeyStore>,
     sessions: RwLock<SessionStore>,
+    handshake_failures: RwLock<HashMap<HandshakeFailureReason, u64>>,
 }
 
 impl AppState {
@@ -109,7 +164,9 @@ impl AppState {
             connections: RwLock::new(HashMap::new()),
             invites: InviteStore::new(),
             rate_limits: RateLimitStore::new(),
+            prekeys: RwLock::new(PrekeyStore::new()),
             sessions: RwLock::new(SessionStore::new()),
+            handshake_failures: RwLock::new(HashMap::new()),
         }
     }
 
@@ -176,6 +233,8 @@ impl AppState {
                 peer_conn: closed.peer_conn,
                 reason,
             });
+
+        self.prekeys.write().await.remove_bundle(id);
 
         DisconnectOutcome {
             connection: removed,
@@ -328,6 +387,98 @@ impl AppState {
         })
     }
 
+    pub async fn publish_prekeys(
+        &self,
+        conn_id: ConnId,
+        ip: IpAddr,
+        req: PrekeyPublishRequest,
+    ) -> Result<PrekeyPublished, PrekeyPublishError> {
+        self.rate_limits
+            .check_prekey_publish(ip, &self.limits)
+            .await
+            .map_err(PrekeyPublishError::RateLimited)?;
+
+        if !self.connection_exists(conn_id).await {
+            return Err(PrekeyPublishError::PeerOffline);
+        }
+
+        validate_prekey_publish(&req).map_err(|_| PrekeyPublishError::InvalidRequest)?;
+
+        let spk = SpkRecord {
+            id: req.spk.id,
+            x25519: req.spk.x25519,
+            sig_ed25519: req.spk.sig_ed25519,
+            exp_unix: req.spk.exp_unix,
+        };
+
+        let opks = req
+            .opks
+            .into_iter()
+            .map(|opk| OpkRecord {
+                id: opk.id,
+                x25519: opk.x25519,
+            })
+            .collect::<Vec<_>>();
+
+        let opk_count =
+            self.prekeys
+                .write()
+                .await
+                .upsert_bundle(conn_id, req.ik_ed25519, spk.clone(), opks);
+
+        Ok(PrekeyPublished {
+            spk_id: spk.id,
+            opk_count,
+        })
+    }
+
+    pub async fn get_peer_prekey_bundle(
+        &self,
+        conn_id: ConnId,
+        ip: IpAddr,
+        req: PrekeyGetRequest,
+    ) -> Result<PrekeyBundleRoute, PrekeyGetError> {
+        self.rate_limits
+            .check_prekey_get(ip, &self.limits)
+            .await
+            .map_err(PrekeyGetError::RateLimited)?;
+
+        let (session_id, peer_conn) = {
+            let sessions = self.sessions.read().await;
+            let (active_session_id, peer_conn) = sessions
+                .peer_for_conn(conn_id)
+                .ok_or(PrekeyGetError::NoActiveSession)?;
+            if active_session_id != req.session_id {
+                return Err(PrekeyGetError::SessionMismatch);
+            }
+            (active_session_id, peer_conn)
+        };
+
+        let peer_bundle = self
+            .prekeys
+            .write()
+            .await
+            .take_peer_bundle(peer_conn)
+            .ok_or(PrekeyGetError::PrekeyNotFound)?;
+
+        Ok(PrekeyBundleRoute {
+            session_id,
+            peer: PublicPrekeyBundle {
+                ik_ed25519: peer_bundle.ik_ed25519,
+                spk: SignedPrekey {
+                    id: peer_bundle.spk.id,
+                    x25519: peer_bundle.spk.x25519,
+                    sig_ed25519: peer_bundle.spk.sig_ed25519,
+                    exp_unix: peer_bundle.spk.exp_unix,
+                },
+                opk: peer_bundle.opk.map(|opk| OneTimePrekey {
+                    id: opk.id,
+                    x25519: opk.x25519,
+                }),
+            },
+        })
+    }
+
     pub async fn end_session_for_conn(
         &self,
         conn_id: ConnId,
@@ -342,6 +493,22 @@ impl AppState {
                 peer_conn: closed.peer_conn,
                 reason,
             })
+    }
+
+    pub async fn record_handshake_failure(&self, reason: HandshakeFailureReason) {
+        let mut failures = self.handshake_failures.write().await;
+        let count = failures.entry(reason).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    pub async fn handshake_failure_count(&self, reason: HandshakeFailureReason) -> u64 {
+        self.handshake_failures
+            .read()
+            .await
+            .get(&reason)
+            .copied()
+            .unwrap_or(0)
     }
 
     async fn create_session(
@@ -430,6 +597,41 @@ fn map_session_create_error(err: SessionCreateError) -> InviteUseError {
     }
 }
 
+fn validate_prekey_publish(req: &PrekeyPublishRequest) -> Result<(), PrekeyValidationError> {
+    if req.ik_ed25519.trim().is_empty() {
+        return Err(PrekeyValidationError::MissingIdentityKey);
+    }
+
+    if req.spk.x25519.trim().is_empty() || req.spk.sig_ed25519.trim().is_empty() {
+        return Err(PrekeyValidationError::MissingSignedPrekey);
+    }
+
+    if req.opks.len() > MAX_OPKS_PER_PUBLISH {
+        return Err(PrekeyValidationError::TooManyOpks);
+    }
+
+    let mut seen_ids = HashSet::with_capacity(req.opks.len());
+    for opk in &req.opks {
+        if opk.x25519.trim().is_empty() {
+            return Err(PrekeyValidationError::InvalidOpk);
+        }
+        if !seen_ids.insert(opk.id) {
+            return Err(PrekeyValidationError::DuplicateOpkId);
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrekeyValidationError {
+    MissingIdentityKey,
+    MissingSignedPrekey,
+    InvalidOpk,
+    DuplicateOpkId,
+    TooManyOpks,
+}
+
 fn min_interval_for_rate(rate_per_sec: u32) -> Duration {
     if rate_per_sec == 0 {
         return Duration::ZERO;
@@ -454,7 +656,9 @@ fn generate_token(len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use darkwire_protocol::events::InviteCreateRequest;
+    use darkwire_protocol::events::{
+        InviteCreateRequest, OneTimePrekey, PrekeyGetRequest, PrekeyPublishRequest, SignedPrekey,
+    };
     use std::net::{IpAddr, Ipv4Addr};
     use tokio::sync::mpsc;
 
@@ -464,6 +668,26 @@ mod tests {
 
     fn channel() -> (OutboundSender, mpsc::Receiver<String>) {
         mpsc::channel(8)
+    }
+
+    fn sample_prekey_publish(opk_ids: &[u32]) -> PrekeyPublishRequest {
+        PrekeyPublishRequest {
+            ik_ed25519: "ik_ed25519_b64u".to_string(),
+            spk: SignedPrekey {
+                id: 7,
+                x25519: "spk_x25519_b64u".to_string(),
+                sig_ed25519: "spk_sig_b64u".to_string(),
+                exp_unix: 1_770_000_000,
+            },
+            opks: opk_ids
+                .iter()
+                .copied()
+                .map(|id| OneTimePrekey {
+                    id,
+                    x25519: format!("opk_{id}_b64u"),
+                })
+                .collect(),
+        }
     }
 
     #[tokio::test]
@@ -736,6 +960,157 @@ mod tests {
             .await
             .expect_err("payload over max bytes should fail");
         assert_eq!(err, MsgSendError::MessageTooLarge);
+    }
+
+    #[tokio::test]
+    async fn prekey_publish_and_get_consumes_one_opk_per_fetch() {
+        let state = AppState::new(LimitsConfig::default());
+        let (tx_a, _rx_a) = channel();
+        let (tx_b, _rx_b) = channel();
+        let inviter = state.register_connection(test_ip(20), tx_a).await;
+        let joiner = state.register_connection(test_ip(21), tx_b).await;
+
+        let created = state
+            .create_invite(
+                inviter,
+                test_ip(20),
+                InviteCreateRequest {
+                    r: vec!["ws://127.0.0.1:7000".to_string()],
+                    e: 600,
+                    o: true,
+                },
+            )
+            .await
+            .expect("invite create should pass");
+
+        let session_id = state
+            .use_invite(
+                joiner,
+                test_ip(21),
+                InviteUseRequest {
+                    invite: created.invite,
+                },
+            )
+            .await
+            .expect("invite use should pass")
+            .session_id;
+
+        let published = state
+            .publish_prekeys(inviter, test_ip(20), sample_prekey_publish(&[10, 11]))
+            .await
+            .expect("prekey publish should pass");
+        assert_eq!(published.spk_id, 7);
+        assert_eq!(published.opk_count, 2);
+
+        let first = state
+            .get_peer_prekey_bundle(joiner, test_ip(21), PrekeyGetRequest { session_id })
+            .await
+            .expect("first bundle fetch should pass");
+        assert_eq!(first.session_id, session_id);
+        assert_eq!(first.peer.opk.expect("first opk").id, 10);
+
+        let second = state
+            .get_peer_prekey_bundle(joiner, test_ip(21), PrekeyGetRequest { session_id })
+            .await
+            .expect("second bundle fetch should pass");
+        assert_eq!(second.peer.opk.expect("second opk").id, 11);
+
+        let third = state
+            .get_peer_prekey_bundle(joiner, test_ip(21), PrekeyGetRequest { session_id })
+            .await
+            .expect("fetch should still pass without opk");
+        assert!(third.peer.opk.is_none());
+    }
+
+    #[tokio::test]
+    async fn prekey_get_rejects_session_mismatch() {
+        let state = AppState::new(LimitsConfig::default());
+        let (tx_a, _rx_a) = channel();
+        let (tx_b, _rx_b) = channel();
+        let inviter = state.register_connection(test_ip(30), tx_a).await;
+        let joiner = state.register_connection(test_ip(31), tx_b).await;
+
+        let created = state
+            .create_invite(
+                inviter,
+                test_ip(30),
+                InviteCreateRequest {
+                    r: vec!["ws://127.0.0.1:7000".to_string()],
+                    e: 600,
+                    o: true,
+                },
+            )
+            .await
+            .expect("invite create should pass");
+
+        state
+            .use_invite(
+                joiner,
+                test_ip(31),
+                InviteUseRequest {
+                    invite: created.invite,
+                },
+            )
+            .await
+            .expect("invite use should pass");
+
+        state
+            .publish_prekeys(inviter, test_ip(30), sample_prekey_publish(&[1]))
+            .await
+            .expect("prekey publish should pass");
+
+        let err = state
+            .get_peer_prekey_bundle(
+                joiner,
+                test_ip(31),
+                PrekeyGetRequest {
+                    session_id: Uuid::new_v4(),
+                },
+            )
+            .await
+            .expect_err("wrong session id should fail");
+        assert_eq!(err, PrekeyGetError::SessionMismatch);
+    }
+
+    #[tokio::test]
+    async fn prekey_publish_rejects_duplicate_opk_ids() {
+        let state = AppState::new(LimitsConfig::default());
+        let (tx_a, _rx_a) = channel();
+        let inviter = state.register_connection(test_ip(40), tx_a).await;
+
+        let err = state
+            .publish_prekeys(inviter, test_ip(40), sample_prekey_publish(&[1, 1]))
+            .await
+            .expect_err("duplicate opk ids should fail");
+        assert_eq!(err, PrekeyPublishError::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn handshake_failure_metrics_increment_by_reason() {
+        let state = AppState::new(LimitsConfig::default());
+
+        state
+            .record_handshake_failure(HandshakeFailureReason::UnsupportedEvent)
+            .await;
+        state
+            .record_handshake_failure(HandshakeFailureReason::UnsupportedEvent)
+            .await;
+        state
+            .record_handshake_failure(HandshakeFailureReason::PrekeyNotFound)
+            .await;
+
+        assert_eq!(
+            state
+                .handshake_failure_count(HandshakeFailureReason::UnsupportedEvent)
+                .await,
+            2
+        );
+        assert_eq!(
+            state
+                .handshake_failure_count(HandshakeFailureReason::PrekeyNotFound)
+                .await,
+            1
+        );
     }
 
     #[tokio::test]

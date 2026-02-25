@@ -1,9 +1,11 @@
-use crate::app_state::{ConnId, InviteCreated, SessionTermination, SharedState};
+use crate::app_state::{
+    ConnId, InviteCreated, PrekeyBundleRoute, PrekeyPublished, SessionTermination, SharedState,
+};
 use axum::extract::ws::{Message, WebSocket};
 use darkwire_protocol::events::{
     self, Envelope, ErrorCode, ErrorEvent, InviteCreatedEvent, InviteUsedEvent, PongEvent,
-    RateLimitScope, RateLimitedEvent, ReadyEvent, SessionEndReason, SessionEndedEvent,
-    SessionStartedEvent,
+    PrekeyBundleEvent, PrekeyPublishedEvent, RateLimitScope, RateLimitedEvent, ReadyEvent,
+    SessionEndReason, SessionEndedEvent, SessionStartedEvent,
 };
 use serde::Serialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -155,6 +157,53 @@ pub(super) async fn send_rate_limited(
         Ok(()) => true,
         Err(err) => {
             warn!(%conn_id, err = %err, "connection.rate_limited_send_failed");
+            false
+        }
+    }
+}
+
+pub(super) async fn send_prekey_published(
+    socket: &mut WebSocket,
+    request_id: Option<String>,
+    published: PrekeyPublished,
+    conn_id: ConnId,
+) -> bool {
+    let event = PrekeyPublishedEvent {
+        spk_id: published.spk_id,
+        opk_count: published.opk_count,
+    };
+
+    match send_event(
+        socket,
+        events::names::E2E_PREKEY_PUBLISHED,
+        request_id,
+        event,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(%conn_id, err = %err, "connection.prekey_published_send_failed");
+            false
+        }
+    }
+}
+
+pub(super) async fn send_prekey_bundle(
+    socket: &mut WebSocket,
+    request_id: Option<String>,
+    bundle: PrekeyBundleRoute,
+    conn_id: ConnId,
+) -> bool {
+    let event = PrekeyBundleEvent {
+        session_id: bundle.session_id,
+        peer: bundle.peer,
+    };
+
+    match send_event(socket, events::names::E2E_PREKEY_BUNDLE, request_id, event).await {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(%conn_id, err = %err, "connection.prekey_bundle_send_failed");
             false
         }
     }

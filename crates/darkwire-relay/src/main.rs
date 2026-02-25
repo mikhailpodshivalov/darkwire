@@ -1,6 +1,7 @@
 mod app_state;
 mod invite_store;
 mod logging;
+mod prekey_store;
 mod rate_limit;
 mod session_store;
 mod ws_handler;
@@ -67,8 +68,9 @@ mod tests {
     use super::*;
     use darkwire_protocol::events::{
         self, Envelope, ErrorCode, ErrorEvent, InviteCreateRequest, InviteCreatedEvent,
-        InviteUseRequest, MsgRecvEvent, MsgSendRequest, RateLimitScope, RateLimitedEvent,
-        SessionEndReason, SessionEndedEvent, SessionStartedEvent,
+        InviteUseRequest, MsgRecvEvent, MsgSendRequest, OneTimePrekey, PrekeyBundleEvent,
+        PrekeyGetRequest, PrekeyPublishRequest, PrekeyPublishedEvent, RateLimitScope,
+        RateLimitedEvent, SessionEndReason, SessionEndedEvent, SessionStartedEvent, SignedPrekey,
     };
     use futures_util::{SinkExt, StreamExt};
     use serde::{Deserialize, Serialize};
@@ -259,11 +261,193 @@ mod tests {
         let _ = server_task.await;
     }
 
+    #[tokio::test]
+    async fn integration_prekey_publish_and_get_consumes_opk() {
+        let (addr, shutdown_tx, server_task) = spawn_test_relay(LimitsConfig::default()).await;
+
+        let mut inviter = connect_client(addr).await;
+        let mut joiner = connect_client(addr).await;
+
+        assert_eq!(
+            recv_with_timeout(&mut inviter).await.event_type,
+            events::names::READY
+        );
+        assert_eq!(
+            recv_with_timeout(&mut joiner).await.event_type,
+            events::names::READY
+        );
+
+        send_event(
+            &mut inviter,
+            events::names::INVITE_CREATE,
+            "req-create",
+            InviteCreateRequest {
+                r: vec![relay_url(addr)],
+                e: 600,
+                o: true,
+            },
+        )
+        .await;
+
+        let invite_created = recv_until(&mut inviter, events::names::INVITE_CREATED).await;
+        let invite = serde_json::from_value::<InviteCreatedEvent>(invite_created.data)
+            .expect("invite.created payload should parse")
+            .invite;
+
+        send_event(
+            &mut joiner,
+            events::names::INVITE_USE,
+            "req-join",
+            InviteUseRequest { invite },
+        )
+        .await;
+        let joiner_started = recv_until(&mut joiner, events::names::SESSION_STARTED).await;
+        let session_id = serde_json::from_value::<SessionStartedEvent>(joiner_started.data)
+            .expect("joiner session.started should parse")
+            .session_id;
+        let _ = recv_until(&mut inviter, events::names::SESSION_STARTED).await;
+
+        send_event(
+            &mut inviter,
+            events::names::E2E_PREKEY_PUBLISH,
+            "req-publish",
+            sample_prekey_publish(7, &[1001]),
+        )
+        .await;
+
+        let published = recv_until(&mut inviter, events::names::E2E_PREKEY_PUBLISHED).await;
+        let published_payload = serde_json::from_value::<PrekeyPublishedEvent>(published.data)
+            .expect("e2e.prekey.published payload should parse");
+        assert_eq!(published_payload.spk_id, 7);
+        assert_eq!(published_payload.opk_count, 1);
+
+        send_event(
+            &mut joiner,
+            events::names::E2E_PREKEY_GET,
+            "req-get-1",
+            PrekeyGetRequest { session_id },
+        )
+        .await;
+        let bundle1 = recv_until(&mut joiner, events::names::E2E_PREKEY_BUNDLE).await;
+        let bundle1_payload = serde_json::from_value::<PrekeyBundleEvent>(bundle1.data)
+            .expect("e2e.prekey.bundle payload should parse");
+        assert_eq!(bundle1_payload.session_id, session_id);
+        assert_eq!(bundle1_payload.peer.opk.expect("first opk").id, 1001);
+
+        send_event(
+            &mut joiner,
+            events::names::E2E_PREKEY_GET,
+            "req-get-2",
+            PrekeyGetRequest { session_id },
+        )
+        .await;
+        let bundle2 = recv_until(&mut joiner, events::names::E2E_PREKEY_BUNDLE).await;
+        let bundle2_payload = serde_json::from_value::<PrekeyBundleEvent>(bundle2.data)
+            .expect("second e2e.prekey.bundle payload should parse");
+        assert_eq!(bundle2_payload.session_id, session_id);
+        assert!(bundle2_payload.peer.opk.is_none());
+
+        let _ = shutdown_tx.send(());
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn integration_prekey_publish_rate_limit_uses_prekey_scope() {
+        let mut limits = LimitsConfig::default();
+        limits.prekey_publish_per_min = 1;
+
+        let (addr, shutdown_tx, server_task) = spawn_test_relay(limits).await;
+        let mut client = connect_client(addr).await;
+
+        assert_eq!(
+            recv_with_timeout(&mut client).await.event_type,
+            events::names::READY
+        );
+
+        send_event(
+            &mut client,
+            events::names::E2E_PREKEY_PUBLISH,
+            "req-publish-1",
+            sample_prekey_publish(1, &[1]),
+        )
+        .await;
+        assert_eq!(
+            recv_with_timeout(&mut client).await.event_type,
+            events::names::E2E_PREKEY_PUBLISHED
+        );
+
+        send_event(
+            &mut client,
+            events::names::E2E_PREKEY_PUBLISH,
+            "req-publish-2",
+            sample_prekey_publish(2, &[2]),
+        )
+        .await;
+        let limited = recv_with_timeout(&mut client).await;
+        assert_eq!(limited.event_type, events::names::RATE_LIMITED);
+        let payload = serde_json::from_value::<RateLimitedEvent>(limited.data)
+            .expect("rate.limited payload should parse");
+        assert_eq!(payload.scope, RateLimitScope::PrekeyPublish);
+        assert!(payload.retry_after_ms >= 1);
+
+        let _ = shutdown_tx.send(());
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn integration_handshake_unsupported_increments_failure_metric() {
+        let (state, addr, shutdown_tx, server_task) =
+            spawn_test_relay_with_state(LimitsConfig::default()).await;
+
+        let mut client = connect_client(addr).await;
+        assert_eq!(
+            recv_with_timeout(&mut client).await.event_type,
+            events::names::READY
+        );
+
+        send_event(
+            &mut client,
+            events::names::E2E_HANDSHAKE_INIT,
+            "req-hs",
+            serde_json::json!({
+                "session_id": uuid::Uuid::new_v4(),
+                "hs_id": uuid::Uuid::new_v4()
+            }),
+        )
+        .await;
+
+        let envelope = recv_with_timeout(&mut client).await;
+        assert_eq!(envelope.event_type, events::names::ERROR);
+        let payload = serde_json::from_value::<ErrorEvent>(envelope.data)
+            .expect("error payload should parse");
+        assert_eq!(payload.code, ErrorCode::HandshakeInvalid);
+
+        let failures = state
+            .handshake_failure_count(app_state::HandshakeFailureReason::UnsupportedEvent)
+            .await;
+        assert_eq!(failures, 1);
+
+        let _ = shutdown_tx.send(());
+        let _ = server_task.await;
+    }
+
     async fn spawn_test_relay(
         limits: LimitsConfig,
     ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let (_state, addr, shutdown_tx, task) = spawn_test_relay_with_state(limits).await;
+        (addr, shutdown_tx, task)
+    }
+
+    async fn spawn_test_relay_with_state(
+        limits: LimitsConfig,
+    ) -> (
+        Arc<AppState>,
+        SocketAddr,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let state = Arc::new(AppState::new(limits));
-        let app = build_app(state);
+        let app = build_app(Arc::clone(&state));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -286,7 +470,7 @@ mod tests {
         // Give the server a short moment to start accepting sockets.
         sleep(Duration::from_millis(20)).await;
 
-        (addr, shutdown_tx, task)
+        (state, addr, shutdown_tx, task)
     }
 
     async fn connect_client(addr: SocketAddr) -> WsClient {
@@ -359,5 +543,25 @@ mod tests {
 
     fn relay_url(addr: SocketAddr) -> String {
         format!("ws://{addr}/ws")
+    }
+
+    fn sample_prekey_publish(spk_id: u32, opk_ids: &[u32]) -> PrekeyPublishRequest {
+        PrekeyPublishRequest {
+            ik_ed25519: "ik_ed25519_b64u".to_string(),
+            spk: SignedPrekey {
+                id: spk_id,
+                x25519: "spk_x25519_b64u".to_string(),
+                sig_ed25519: "spk_sig_b64u".to_string(),
+                exp_unix: 1_770_000_000,
+            },
+            opks: opk_ids
+                .iter()
+                .copied()
+                .map(|id| OneTimePrekey {
+                    id,
+                    x25519: format!("opk_{id}_x25519_b64u"),
+                })
+                .collect(),
+        }
     }
 }

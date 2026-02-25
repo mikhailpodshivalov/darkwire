@@ -7,6 +7,10 @@ pub mod names {
     pub const MSG_SEND: &str = "msg.send";
     pub const SESSION_LEAVE: &str = "session.leave";
     pub const PING: &str = "ping";
+    pub const E2E_PREKEY_PUBLISH: &str = "e2e.prekey.publish";
+    pub const E2E_PREKEY_GET: &str = "e2e.prekey.get";
+    pub const E2E_HANDSHAKE_INIT: &str = "e2e.handshake.init";
+    pub const E2E_HANDSHAKE_ACCEPT: &str = "e2e.handshake.accept";
 
     pub const READY: &str = "ready";
     pub const INVITE_CREATED: &str = "invite.created";
@@ -14,6 +18,8 @@ pub mod names {
     pub const SESSION_STARTED: &str = "session.started";
     pub const MSG_RECV: &str = "msg.recv";
     pub const SESSION_ENDED: &str = "session.ended";
+    pub const E2E_PREKEY_PUBLISHED: &str = "e2e.prekey.published";
+    pub const E2E_PREKEY_BUNDLE: &str = "e2e.prekey.bundle";
     pub const RATE_LIMITED: &str = "rate.limited";
     pub const ERROR: &str = "error";
     pub const PONG: &str = "pong";
@@ -68,6 +74,32 @@ pub struct SessionLeaveRequest {}
 pub struct PingRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignedPrekey {
+    pub id: u32,
+    pub x25519: String,
+    pub sig_ed25519: String,
+    pub exp_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OneTimePrekey {
+    pub id: u32,
+    pub x25519: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrekeyPublishRequest {
+    pub ik_ed25519: String,
+    pub spk: SignedPrekey,
+    pub opks: Vec<OneTimePrekey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrekeyGetRequest {
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadyEvent {
     pub server_time: i64,
 }
@@ -108,11 +140,33 @@ pub struct SessionEndedEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrekeyPublishedEvent {
+    pub spk_id: u32,
+    pub opk_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicPrekeyBundle {
+    pub ik_ed25519: String,
+    pub spk: SignedPrekey,
+    pub opk: Option<OneTimePrekey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrekeyBundleEvent {
+    pub session_id: Uuid,
+    pub peer: PublicPrekeyBundle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RateLimitScope {
     InviteCreate,
     InviteUse,
     MsgSend,
+    PrekeyPublish,
+    PrekeyGet,
+    Handshake,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,6 +184,16 @@ pub enum ErrorCode {
     InviteUsed,
     NoActiveSession,
     MessageTooLarge,
+    UnsupportedProtocol,
+    E2eRequired,
+    PrekeyNotFound,
+    PrekeyDepleted,
+    HandshakeInvalid,
+    HandshakeTimeout,
+    DecryptFailed,
+    ReplayDetected,
+    IdentityKeyChanged,
+    StateConflict,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
