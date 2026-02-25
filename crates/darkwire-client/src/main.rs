@@ -1,6 +1,7 @@
 mod bootstrap;
 mod commands;
 mod config;
+mod e2e;
 mod keys;
 mod ui;
 mod wire;
@@ -11,8 +12,9 @@ use commands::{parse_user_command, UserCommand};
 use config::{resolve_invite_relay, ClientArgs};
 use crossterm::event::{Event, EventStream};
 use darkwire_protocol::events::{
-    self, Envelope, InviteCreateRequest, InviteUseRequest, MsgSendRequest, SessionLeaveRequest,
+    self, Envelope, InviteCreateRequest, InviteUseRequest, SessionLeaveRequest,
 };
+use e2e::SecureMessenger;
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use keys::{default_key_file_path, KeyManager};
 use serde::Serialize;
@@ -26,7 +28,7 @@ use tokio::{
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use ui::{RawModeGuard, TerminalUi};
-use wire::{extract_wire_action, handle_server_text, ClientState};
+use wire::{extract_wire_action, handle_server_text, ClientState, WireAction};
 
 type WsWriter = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
@@ -63,6 +65,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut state = ClientState::default();
     let mut bootstrap = BootstrapState::default();
+    let mut secure_messenger = SecureMessenger::default();
     let mut request_counter = 1_u64;
     publish_prekeys(&mut ws_writer, &keys, &mut request_counter).await?;
     request_invite(
@@ -90,6 +93,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     invite_ttl,
                     &mut keys,
                     &mut bootstrap,
+                    &mut secure_messenger,
                     &mut request_counter,
                 ).await?;
 
@@ -115,6 +119,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     invite_ttl,
                     &mut keys,
                     &mut bootstrap,
+                    &mut secure_messenger,
                     &mut request_counter,
                 ).await?;
 
@@ -130,15 +135,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             ui.print_line(&line);
                         }
                         if let Some(action) = action {
-                            handle_wire_action(
-                                action,
-                                &mut ws_writer,
-                                &mut state,
-                                &mut bootstrap,
-                                &mut keys,
-                                &mut ui,
-                                &mut request_counter,
-                            ).await?;
+                            match action {
+                                WireAction::EncryptedMessage(event) => {
+                                    match secure_messenger.decrypt_incoming(&event) {
+                                        Ok(message) => ui.print_line(&format!("peer> {message}")),
+                                        Err(err) => ui.print_error(&format!("[e2e] drop inbound message: {err}")),
+                                    }
+                                }
+                                action => {
+                                    if matches!(action, WireAction::SessionStarted { .. } | WireAction::SessionEnded) {
+                                        secure_messenger.clear();
+                                    }
+
+                                    handle_wire_action(
+                                        action,
+                                        &mut ws_writer,
+                                        &mut state,
+                                        &mut bootstrap,
+                                        &mut keys,
+                                        &mut ui,
+                                        &mut request_counter,
+                                    ).await?;
+
+                                    if let Some(material) = bootstrap.take_secure_session_material() {
+                                        if let Err(err) = secure_messenger.activate(&material) {
+                                            ui.print_error(&format!("[e2e] failed to activate secure messaging: {err}"));
+                                            state.secure_active = false;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
@@ -175,6 +201,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         &mut bootstrap,
                         &mut request_counter,
                     ).await?;
+                    secure_messenger.clear();
                 }
             }
         }
@@ -223,6 +250,7 @@ async fn handle_user_input(
     invite_ttl: u32,
     keys: &mut KeyManager,
     bootstrap: &mut BootstrapState,
+    secure_messenger: &mut SecureMessenger,
     request_counter: &mut u64,
 ) -> Result<bool, Box<dyn Error>> {
     match parse_user_command(line) {
@@ -261,6 +289,7 @@ async fn handle_user_input(
             publish_prekeys(ws_writer, keys, request_counter).await?;
             if state.active_session {
                 abort_handshake_session(ws_writer, state, bootstrap, request_counter).await?;
+                secure_messenger.clear();
             }
             ui.print_line(&format!(
                 "[keys] identity revoked/regenerated + published {}",
@@ -307,9 +336,20 @@ async fn handle_user_input(
                 );
                 return Ok(true);
             }
-
-            let payload = MsgSendRequest { text };
-            send_request(ws_writer, events::names::MSG_SEND, payload, request_counter).await?;
+            let payload = match secure_messenger.encrypt_outgoing(&text) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    ui.print_error(&format!("[e2e] encrypt failed: {err}"));
+                    return Ok(true);
+                }
+            };
+            send_request(
+                ws_writer,
+                events::names::E2E_MSG_SEND,
+                payload,
+                request_counter,
+            )
+            .await?;
             Ok(true)
         }
     }

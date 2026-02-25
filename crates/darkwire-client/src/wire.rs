@@ -1,7 +1,7 @@
 use darkwire_protocol::events::{
-    self, ErrorEvent, HandshakeAcceptRequest, HandshakeInitRequest, InviteCreatedEvent,
-    MsgRecvEvent, PrekeyBundleEvent, PrekeyPublishedEvent, RateLimitedEvent, ReadyEvent,
-    SessionEndReason, SessionEndedEvent, SessionStartedEvent,
+    self, E2eMsgRecvEvent, ErrorEvent, HandshakeAcceptRequest, HandshakeInitRequest,
+    InviteCreatedEvent, MsgRecvEvent, PrekeyBundleEvent, PrekeyPublishedEvent, RateLimitedEvent,
+    ReadyEvent, SessionEndReason, SessionEndedEvent, SessionStartedEvent,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -20,6 +20,7 @@ pub enum WireAction {
     PrekeyBundle(PrekeyBundleEvent),
     HandshakeInitRecv(HandshakeInitRequest),
     HandshakeAcceptRecv(HandshakeAcceptRequest),
+    EncryptedMessage(E2eMsgRecvEvent),
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +59,9 @@ pub fn extract_wire_action(raw: &str) -> Option<WireAction> {
                 .ok()
                 .map(WireAction::HandshakeAcceptRecv)
         }
+        events::names::E2E_MSG_RECV => serde_json::from_value::<E2eMsgRecvEvent>(envelope.data)
+            .ok()
+            .map(WireAction::EncryptedMessage),
         _ => None,
     }
 }
@@ -135,6 +139,9 @@ pub fn handle_server_text(raw: &str, state: &mut ClientState) -> Option<String> 
             if let Ok(event) = serde_json::from_value::<MsgRecvEvent>(envelope.data) {
                 return Some(format!("peer> {}", event.text));
             }
+        }
+        events::names::E2E_MSG_RECV => {
+            return None;
         }
         events::names::SESSION_ENDED => {
             if let Ok(event) = serde_json::from_value::<SessionEndedEvent>(envelope.data) {

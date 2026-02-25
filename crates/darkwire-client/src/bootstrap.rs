@@ -24,6 +24,10 @@ impl BootstrapState {
         self.secure_session = None;
     }
 
+    pub fn take_secure_session_material(&mut self) -> Option<SecureSessionMaterial> {
+        self.secure_session.take()
+    }
+
     pub fn handshake_timeout_message(&self, now_unix: u64) -> Option<String> {
         let pending = self.pending_initiator.as_ref()?;
         if now_unix.saturating_sub(pending.started_unix) > HANDSHAKE_TIMEOUT_SECS {
@@ -135,6 +139,7 @@ pub async fn handle_wire_action(
                 }
             }
         }
+        WireAction::EncryptedMessage(_) => {}
     }
 
     Ok(())

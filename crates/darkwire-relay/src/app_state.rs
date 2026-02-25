@@ -157,6 +157,14 @@ pub enum MsgSendError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum E2eMsgSendError {
+    NoActiveSession,
+    SessionMismatch,
+    MessageTooLarge,
+    RateLimited(Duration),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrekeyPublishError {
     RateLimited(RateLimitHit),
     PeerOffline,
@@ -431,6 +439,47 @@ impl AppState {
         let (session_id, peer_conn) = sessions
             .peer_for_conn(sender_conn)
             .ok_or(MsgSendError::NoActiveSession)?;
+
+        sessions.touch_conn(sender_conn, now);
+
+        Ok(MessageRoute {
+            session_id,
+            peer_conn,
+        })
+    }
+
+    pub async fn route_encrypted_message(
+        &self,
+        sender_conn: ConnId,
+        session_id: SessionId,
+        payload_bytes: usize,
+    ) -> Result<MessageRoute, E2eMsgSendError> {
+        if payload_bytes > self.limits.max_msg_bytes {
+            return Err(E2eMsgSendError::MessageTooLarge);
+        }
+
+        {
+            let sessions = self.sessions.read().await;
+            let (active_session_id, _) = sessions
+                .peer_for_conn(sender_conn)
+                .ok_or(E2eMsgSendError::NoActiveSession)?;
+            if active_session_id != session_id {
+                return Err(E2eMsgSendError::SessionMismatch);
+            }
+        }
+
+        let now = Instant::now();
+        self.enforce_message_rate_limit(sender_conn, now)
+            .await
+            .map_err(map_msg_send_error)?;
+
+        let mut sessions = self.sessions.write().await;
+        let (active_session_id, peer_conn) = sessions
+            .peer_for_conn(sender_conn)
+            .ok_or(E2eMsgSendError::NoActiveSession)?;
+        if active_session_id != session_id {
+            return Err(E2eMsgSendError::SessionMismatch);
+        }
 
         sessions.touch_conn(sender_conn, now);
 
@@ -787,6 +836,14 @@ fn map_take_handshake_error(err: TakeHandshakeError) -> HandshakeAcceptError {
         TakeHandshakeError::SessionMismatch | TakeHandshakeError::ResponderMismatch => {
             HandshakeAcceptError::StateConflict
         }
+    }
+}
+
+fn map_msg_send_error(err: MsgSendError) -> E2eMsgSendError {
+    match err {
+        MsgSendError::NoActiveSession => E2eMsgSendError::NoActiveSession,
+        MsgSendError::MessageTooLarge => E2eMsgSendError::MessageTooLarge,
+        MsgSendError::RateLimited(retry_after) => E2eMsgSendError::RateLimited(retry_after),
     }
 }
 
@@ -1208,6 +1265,64 @@ mod tests {
             .await
             .expect_err("payload over max bytes should fail");
         assert_eq!(err, MsgSendError::MessageTooLarge);
+    }
+
+    #[tokio::test]
+    async fn route_encrypted_message_validates_session_and_size() {
+        let mut limits = LimitsConfig::default();
+        limits.max_msg_bytes = 16;
+        limits.msg_per_sec = 100;
+
+        let state = AppState::new(limits);
+        let (tx_a, _rx_a) = channel();
+        let (tx_b, _rx_b) = channel();
+
+        let inviter = state.register_connection(test_ip(40), tx_a).await;
+        let joiner = state.register_connection(test_ip(41), tx_b).await;
+
+        let created = state
+            .create_invite(
+                inviter,
+                test_ip(40),
+                InviteCreateRequest {
+                    r: vec!["ws://127.0.0.1:7000".to_string()],
+                    e: 600,
+                    o: true,
+                },
+            )
+            .await
+            .expect("invite create should pass");
+
+        let session_id = state
+            .use_invite(
+                joiner,
+                test_ip(41),
+                InviteUseRequest {
+                    invite: created.invite,
+                },
+            )
+            .await
+            .expect("invite use should pass")
+            .session_id;
+
+        let route = state
+            .route_encrypted_message(inviter, session_id, 12)
+            .await
+            .expect("e2e payload should route");
+        assert_eq!(route.session_id, session_id);
+        assert_eq!(route.peer_conn, joiner);
+
+        let mismatch = state
+            .route_encrypted_message(inviter, Uuid::new_v4(), 12)
+            .await
+            .expect_err("session mismatch should fail");
+        assert_eq!(mismatch, E2eMsgSendError::SessionMismatch);
+
+        let too_large = state
+            .route_encrypted_message(inviter, session_id, 17)
+            .await
+            .expect_err("oversized encrypted payload should fail");
+        assert_eq!(too_large, E2eMsgSendError::MessageTooLarge);
     }
 
     #[tokio::test]

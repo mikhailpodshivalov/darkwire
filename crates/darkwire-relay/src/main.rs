@@ -68,11 +68,11 @@ fn init_tracing(log_filter: &str) {
 mod tests {
     use super::*;
     use darkwire_protocol::events::{
-        self, Envelope, ErrorCode, ErrorEvent, HandshakeAcceptRequest, HandshakeInitRequest,
-        InviteCreateRequest, InviteCreatedEvent, InviteUseRequest, MsgRecvEvent, MsgSendRequest,
-        OneTimePrekey, PrekeyBundleEvent, PrekeyGetRequest, PrekeyPublishRequest,
-        PrekeyPublishedEvent, RateLimitScope, RateLimitedEvent, SessionEndReason,
-        SessionEndedEvent, SessionStartedEvent, SignedPrekey,
+        self, E2eMsgAd, E2eMsgSendRequest, Envelope, ErrorCode, ErrorEvent, HandshakeAcceptRequest,
+        HandshakeInitRequest, InviteCreateRequest, InviteCreatedEvent, InviteUseRequest,
+        MsgRecvEvent, MsgSendRequest, OneTimePrekey, PrekeyBundleEvent, PrekeyGetRequest,
+        PrekeyPublishRequest, PrekeyPublishedEvent, RateLimitScope, RateLimitedEvent,
+        SessionEndReason, SessionEndedEvent, SessionStartedEvent, SignedPrekey,
     };
     use futures_util::{SinkExt, StreamExt};
     use serde::{Deserialize, Serialize};
@@ -209,6 +209,90 @@ mod tests {
             .expect("session.ended payload should parse");
         assert_eq!(ended_payload.session_id, inviter_session);
         assert_eq!(ended_payload.reason, SessionEndReason::PeerDisconnect);
+
+        let _ = shutdown_tx.send(());
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn integration_e2e_msg_send_routes_ciphertext_without_transform() {
+        let (addr, shutdown_tx, server_task) = spawn_test_relay(LimitsConfig::default()).await;
+
+        let mut inviter = connect_client(addr).await;
+        let mut joiner = connect_client(addr).await;
+
+        assert_eq!(
+            recv_with_timeout(&mut inviter).await.event_type,
+            events::names::READY
+        );
+        assert_eq!(
+            recv_with_timeout(&mut joiner).await.event_type,
+            events::names::READY
+        );
+
+        send_event(
+            &mut inviter,
+            events::names::INVITE_CREATE,
+            "req-create",
+            InviteCreateRequest {
+                r: vec![relay_url(addr)],
+                e: 600,
+                o: true,
+            },
+        )
+        .await;
+
+        let invite_created = recv_until(&mut inviter, events::names::INVITE_CREATED).await;
+        let invite = serde_json::from_value::<InviteCreatedEvent>(invite_created.data)
+            .expect("invite.created payload should parse")
+            .invite;
+
+        send_event(
+            &mut joiner,
+            events::names::INVITE_USE,
+            "req-join",
+            InviteUseRequest { invite },
+        )
+        .await;
+
+        let _ = recv_until(&mut joiner, events::names::INVITE_USED).await;
+        let joiner_started = recv_until(&mut joiner, events::names::SESSION_STARTED).await;
+        let session_id = serde_json::from_value::<SessionStartedEvent>(joiner_started.data)
+            .expect("joiner session.started should parse")
+            .session_id;
+        let _ = recv_until(&mut inviter, events::names::SESSION_STARTED).await;
+
+        let outbound = E2eMsgSendRequest {
+            session_id,
+            n: 1,
+            pn: 0,
+            dh_x25519: "A".repeat(43),
+            nonce: "BBBBBBBBBBBBBBBB".to_string(),
+            ct: "ciphertext_payload".to_string(),
+            ad: E2eMsgAd {
+                pv: 2,
+                session_id,
+                n: 1,
+                pn: 0,
+            },
+        };
+
+        send_event(
+            &mut inviter,
+            events::names::E2E_MSG_SEND,
+            "req-e2e-msg",
+            outbound.clone(),
+        )
+        .await;
+
+        let routed = recv_until(&mut joiner, events::names::E2E_MSG_RECV).await;
+        let inbound = serde_json::from_value::<E2eMsgSendRequest>(routed.data)
+            .expect("e2e.msg.recv payload should parse");
+        assert_eq!(inbound.session_id, session_id);
+        assert_eq!(inbound.n, 1);
+        assert_eq!(inbound.ct, outbound.ct);
+        assert_eq!(inbound.nonce, outbound.nonce);
+        assert_eq!(inbound.ad, outbound.ad);
 
         let _ = shutdown_tx.send(());
         let _ = server_task.await;

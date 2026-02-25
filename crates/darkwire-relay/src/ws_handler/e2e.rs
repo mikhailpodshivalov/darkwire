@@ -1,17 +1,18 @@
 use crate::app_state::{
-    ConnId, HandshakeAcceptError, HandshakeFailureReason, HandshakeInitError, PrekeyGetError,
-    PrekeyPublishError, SharedState,
+    ConnId, E2eMsgSendError, HandshakeAcceptError, HandshakeFailureReason, HandshakeInitError,
+    PrekeyGetError, PrekeyPublishError, SharedState,
 };
 use crate::logging;
 use axum::extract::ws::WebSocket;
 use darkwire_protocol::events::{
-    self, ErrorCode, HandshakeAcceptRequest, HandshakeInitRequest, PrekeyGetRequest,
-    PrekeyPublishRequest, RateLimitScope,
+    self, E2eMsgSendRequest, ErrorCode, HandshakeAcceptRequest, HandshakeInitRequest,
+    PrekeyGetRequest, PrekeyPublishRequest, RateLimitScope, SessionEndReason,
 };
 use std::net::IpAddr;
 
 use super::outgoing::{
     encode_event, send_error, send_prekey_bundle, send_prekey_published, send_rate_limited,
+    send_session_ended,
 };
 
 pub(super) async fn handle_prekey_publish(
@@ -461,6 +462,115 @@ pub(super) async fn handle_handshake_accept(
             .await
         }
     }
+}
+
+pub(super) async fn handle_encrypted_message(
+    socket: &mut WebSocket,
+    state: &SharedState,
+    conn_id: ConnId,
+    _ip: IpAddr,
+    request_id: Option<String>,
+    data: serde_json::Value,
+) -> bool {
+    let request: E2eMsgSendRequest = match serde_json::from_value(data) {
+        Ok(request) if is_valid_e2e_message_payload(&request) => request,
+        _ => {
+            return send_error(
+                socket,
+                request_id,
+                ErrorCode::BadRequest,
+                "invalid e2e.msg.send payload",
+                conn_id,
+            )
+            .await;
+        }
+    };
+
+    let payload_bytes = serde_json::to_vec(&request)
+        .map(|raw| raw.len())
+        .unwrap_or(usize::MAX);
+
+    match state
+        .route_encrypted_message(conn_id, request.session_id, payload_bytes)
+        .await
+    {
+        Ok(route) => {
+            let payload = encode_event(events::names::E2E_MSG_RECV, None, request);
+            if !state.send_to_connection(route.peer_conn, payload).await {
+                if let Some(ended) = state
+                    .end_session_for_conn(conn_id, SessionEndReason::PeerDisconnect)
+                    .await
+                {
+                    let _ = send_session_ended(
+                        socket,
+                        None,
+                        ended.session_id,
+                        SessionEndReason::PeerDisconnect,
+                        conn_id,
+                    )
+                    .await;
+                }
+            }
+
+            true
+        }
+        Err(E2eMsgSendError::NoActiveSession) => {
+            send_error(
+                socket,
+                request_id,
+                ErrorCode::NoActiveSession,
+                "no active session",
+                conn_id,
+            )
+            .await
+        }
+        Err(E2eMsgSendError::SessionMismatch) => {
+            send_error(
+                socket,
+                request_id,
+                ErrorCode::StateConflict,
+                "session mismatch for e2e.msg.send",
+                conn_id,
+            )
+            .await
+        }
+        Err(E2eMsgSendError::MessageTooLarge) => {
+            send_error(
+                socket,
+                request_id,
+                ErrorCode::MessageTooLarge,
+                "encrypted message exceeds max size",
+                conn_id,
+            )
+            .await
+        }
+        Err(E2eMsgSendError::RateLimited(retry_after)) => {
+            send_rate_limited(
+                socket,
+                request_id,
+                RateLimitScope::MsgSend,
+                retry_after,
+                conn_id,
+            )
+            .await
+        }
+    }
+}
+
+fn is_valid_e2e_message_payload(request: &E2eMsgSendRequest) -> bool {
+    if request.n == 0 {
+        return false;
+    }
+    if request.nonce.trim().is_empty()
+        || request.ct.trim().is_empty()
+        || request.dh_x25519.trim().is_empty()
+    {
+        return false;
+    }
+    request.ad.pv == 2
+        && request.ad.session_id == request.session_id
+        && request.ad.n == request.n
+        && request.ad.pn == request.pn
 }
 
 async fn record_handshake_failure(

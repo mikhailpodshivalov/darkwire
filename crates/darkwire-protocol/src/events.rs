@@ -5,6 +5,7 @@ pub mod names {
     pub const INVITE_CREATE: &str = "invite.create";
     pub const INVITE_USE: &str = "invite.use";
     pub const MSG_SEND: &str = "msg.send";
+    pub const E2E_MSG_SEND: &str = "e2e.msg.send";
     pub const SESSION_LEAVE: &str = "session.leave";
     pub const PING: &str = "ping";
     pub const E2E_PREKEY_PUBLISH: &str = "e2e.prekey.publish";
@@ -17,6 +18,7 @@ pub mod names {
     pub const INVITE_USED: &str = "invite.used";
     pub const SESSION_STARTED: &str = "session.started";
     pub const MSG_RECV: &str = "msg.recv";
+    pub const E2E_MSG_RECV: &str = "e2e.msg.recv";
     pub const SESSION_ENDED: &str = "session.ended";
     pub const E2E_PREKEY_PUBLISHED: &str = "e2e.prekey.published";
     pub const E2E_PREKEY_BUNDLE: &str = "e2e.prekey.bundle";
@@ -68,6 +70,27 @@ pub struct InviteUseRequest {
 pub struct MsgSendRequest {
     pub text: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct E2eMsgAd {
+    pub pv: u8,
+    pub session_id: Uuid,
+    pub n: u64,
+    pub pn: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct E2eMsgSendRequest {
+    pub session_id: Uuid,
+    pub n: u64,
+    pub pn: u64,
+    pub dh_x25519: String,
+    pub nonce: String,
+    pub ct: String,
+    pub ad: E2eMsgAd,
+}
+
+pub type E2eMsgRecvEvent = E2eMsgSendRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SessionLeaveRequest {}
@@ -252,5 +275,34 @@ mod tests {
         assert_eq!(raw["t"], names::INVITE_USE);
         assert_eq!(raw["rid"], "req-1");
         assert_eq!(raw["d"]["invite"], "DL1:abc.def");
+    }
+
+    #[test]
+    fn e2e_msg_envelope_serializes_expected_fields() {
+        let session_id = Uuid::new_v4();
+        let msg = Envelope::new(
+            names::E2E_MSG_SEND,
+            E2eMsgSendRequest {
+                session_id,
+                n: 1,
+                pn: 0,
+                dh_x25519: "a".repeat(43),
+                nonce: "b".repeat(16),
+                ct: "c".repeat(24),
+                ad: E2eMsgAd {
+                    pv: 2,
+                    session_id,
+                    n: 1,
+                    pn: 0,
+                },
+            },
+        )
+        .with_request_id("req-e2e");
+
+        let raw = serde_json::to_value(&msg).expect("serialize envelope");
+        assert_eq!(raw["t"], names::E2E_MSG_SEND);
+        assert_eq!(raw["rid"], "req-e2e");
+        assert_eq!(raw["d"]["session_id"], session_id.to_string());
+        assert_eq!(raw["d"]["ad"]["pv"], 2);
     }
 }

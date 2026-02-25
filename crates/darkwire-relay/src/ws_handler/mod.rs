@@ -374,6 +374,10 @@ async fn handle_text_message(
             e2e::handle_handshake_accept(socket, state, conn_id, ip, request_id, incoming.data)
                 .await
         }
+        events::names::E2E_MSG_SEND => {
+            e2e::handle_encrypted_message(socket, state, conn_id, ip, request_id, incoming.data)
+                .await
+        }
         events::names::MSG_SEND => {
             let request: MsgSendRequest = match serde_json::from_value(incoming.data) {
                 Ok(request) => request,
