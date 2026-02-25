@@ -2,6 +2,10 @@
 pub enum UserCommand {
     CreateInvite,
     ConnectInvite(String),
+    KeyStatus,
+    KeyRotate,
+    KeyRefill,
+    KeyRevoke,
     Quit,
     SendMessage(String),
     Ignore,
@@ -20,6 +24,22 @@ pub fn parse_user_command(line: &str) -> UserCommand {
 
     if trimmed == "/q" {
         return UserCommand::Quit;
+    }
+
+    if trimmed == "/keys" {
+        return UserCommand::KeyStatus;
+    }
+
+    if trimmed == "/keys rotate" {
+        return UserCommand::KeyRotate;
+    }
+
+    if trimmed == "/keys refill" {
+        return UserCommand::KeyRefill;
+    }
+
+    if trimmed == "/keys revoke" {
+        return UserCommand::KeyRevoke;
     }
 
     if trimmed.starts_with("/c") {
@@ -80,5 +100,25 @@ mod tests {
     #[test]
     fn parse_command_unknown_for_bad_connect() {
         assert_eq!(parse_user_command("/c"), UserCommand::Unknown);
+    }
+
+    #[test]
+    fn parse_command_key_status() {
+        assert_eq!(parse_user_command("/keys"), UserCommand::KeyStatus);
+    }
+
+    #[test]
+    fn parse_command_key_rotate() {
+        assert_eq!(parse_user_command("/keys rotate"), UserCommand::KeyRotate);
+    }
+
+    #[test]
+    fn parse_command_key_refill() {
+        assert_eq!(parse_user_command("/keys refill"), UserCommand::KeyRefill);
+    }
+
+    #[test]
+    fn parse_command_key_revoke() {
+        assert_eq!(parse_user_command("/keys revoke"), UserCommand::KeyRevoke);
     }
 }

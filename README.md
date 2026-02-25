@@ -124,6 +124,10 @@ After `session.started` on both sides, type text lines to chat.
 - `/new` create/rotate invite (invalidates previous invite for this client)
 - `/i` legacy alias for `/new`
 - `/c CODE` connect by invite
+- `/keys` show local key status (fingerprint, signed prekey id/expiry, OPK count)
+- `/keys rotate` rotate signed prekey and publish new bundle
+- `/keys refill` refill OPK pool to target and publish new bundle
+- `/keys revoke` revoke local identity (regenerate identity + prekeys) and publish new bundle
 - `/q` quit (sends `session.leave` when session is active)
 - any other non-empty line sends chat message to active session
 
@@ -137,6 +141,13 @@ After `session.started` on both sides, type text lines to chat.
 - `--invite-relay <ws://.../ws>` (`DARKWIRE_INVITE_RELAY`), default = value of `--relay`
 - `--invite-ttl <seconds>` (`DARKWIRE_INVITE_TTL`), default `600` (range `1..=86400`)
 - `--demo-incoming-ms <ms>` (`DARKWIRE_DEMO_INCOMING_MS`), optional simulated incoming events for terminal UI stress test (range `50..=60000`)
+- `--key-file <path>` (`DARKWIRE_KEY_FILE`), optional keystore file path (default `~/.darkwire/keys.json`)
+
+### Client key lifecycle (Phase 2.6 baseline)
+- On first launch, client generates local identity key (Ed25519), signed prekey, and one-time prekeys.
+- Client stores key material locally in keystore file with restricted permissions (`0700` dir, `0600` file on Unix).
+- Signed prekey auto-rotates on expiry; OPK pool auto-refills when low.
+- Client auto-publishes prekey bundle on startup and after `/keys rotate|refill|revoke`.
 
 ## Demo scenario (manual)
 1. Start relay.

@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod keys;
 mod ui;
 mod wire;
 
@@ -11,6 +12,7 @@ use darkwire_protocol::events::{
     self, Envelope, InviteCreateRequest, InviteUseRequest, MsgSendRequest, SessionLeaveRequest,
 };
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+use keys::{default_key_file_path, KeyManager};
 use serde::Serialize;
 use std::{error::Error, io::IsTerminal};
 use tokio::{
@@ -34,15 +36,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let relay_ws = args.relay.clone();
     let invite_relay = resolve_invite_relay(&args);
     let invite_ttl = args.invite_ttl;
+    let key_file = args.key_file.clone().unwrap_or_else(default_key_file_path);
     let interactive_stdin = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let _raw_mode_guard = RawModeGuard::activate(interactive_stdin)?;
     let mut ui = TerminalUi::new(interactive_stdin);
     let demo_enabled = args.demo_incoming_ms.is_some();
     let mut demo_rx = spawn_demo_incoming(args.demo_incoming_ms);
+    let mut keys = KeyManager::load_or_init(key_file)?;
 
     ui.print_line(&format!("Connecting to {relay_ws} ..."));
     let (ws_stream, _) = connect_async(relay_ws.as_str()).await?;
-    ui.print_line("Connected. Commands: /new, /c CODE, /q (/i alias)");
+    ui.print_line("Connected. Commands: /new, /c CODE, /keys, /keys rotate, /keys refill, /keys revoke, /q (/i alias)");
+    ui.print_line(&format!(
+        "[keys] {} file={}",
+        keys.status_line(),
+        keys.key_file().display()
+    ));
 
     let (mut ws_writer, mut ws_reader) = ws_stream.split();
     let mut stdin_lines = BufReader::new(tokio::io::stdin()).lines();
@@ -50,6 +59,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut state = ClientState::default();
     let mut request_counter = 1_u64;
+    publish_prekeys(&mut ws_writer, &keys, &mut request_counter).await?;
     request_invite(
         &mut ws_writer,
         &invite_relay,
@@ -73,6 +83,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     &mut ui,
                     &invite_relay,
                     invite_ttl,
+                    &mut keys,
                     &mut request_counter,
                 ).await?;
 
@@ -96,6 +107,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     &mut ui,
                     &invite_relay,
                     invite_ttl,
+                    &mut keys,
                     &mut request_counter,
                 ).await?;
 
@@ -179,12 +191,47 @@ async fn handle_user_input(
     ui: &mut TerminalUi,
     invite_relay: &str,
     invite_ttl: u32,
+    keys: &mut KeyManager,
     request_counter: &mut u64,
 ) -> Result<bool, Box<dyn Error>> {
     match parse_user_command(line) {
         UserCommand::Ignore => Ok(true),
         UserCommand::Unknown => {
-            ui.print_line("Unknown command. Use /new, /c CODE, /q");
+            ui.print_line(
+                "Unknown command. Use /new, /c CODE, /keys, /keys rotate, /keys refill, /keys revoke, /q",
+            );
+            Ok(true)
+        }
+        UserCommand::KeyStatus => {
+            ui.print_line(&format!("[keys] {}", keys.status_line()));
+            Ok(true)
+        }
+        UserCommand::KeyRotate => {
+            keys.rotate_signed_prekey()?;
+            publish_prekeys(ws_writer, keys, request_counter).await?;
+            ui.print_line(&format!(
+                "[keys] rotated + published {}",
+                keys.status_line()
+            ));
+            Ok(true)
+        }
+        UserCommand::KeyRefill => {
+            let added = keys.refill_one_time_prekeys()?;
+            publish_prekeys(ws_writer, keys, request_counter).await?;
+            ui.print_line(&format!(
+                "[keys] refill added={} + published {}",
+                added,
+                keys.status_line()
+            ));
+            Ok(true)
+        }
+        UserCommand::KeyRevoke => {
+            keys.revoke_and_regenerate()?;
+            publish_prekeys(ws_writer, keys, request_counter).await?;
+            ui.print_line(&format!(
+                "[keys] identity revoked/regenerated + published {}",
+                keys.status_line()
+            ));
             Ok(true)
         }
         UserCommand::Quit => {
@@ -243,6 +290,21 @@ async fn request_invite(
     send_request(
         ws_writer,
         events::names::INVITE_CREATE,
+        payload,
+        request_counter,
+    )
+    .await
+}
+
+async fn publish_prekeys(
+    ws_writer: &mut WsWriter,
+    keys: &KeyManager,
+    request_counter: &mut u64,
+) -> Result<(), Box<dyn Error>> {
+    let payload = keys.build_prekey_publish_request();
+    send_request(
+        ws_writer,
+        events::names::E2E_PREKEY_PUBLISH,
         payload,
         request_counter,
     )
