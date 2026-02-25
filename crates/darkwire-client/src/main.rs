@@ -137,8 +137,8 @@ impl TerminalUi {
         match key.code {
             KeyCode::Enter => {
                 let submitted = std::mem::take(&mut self.input_buffer);
-                self.clear_line();
-                println!();
+                print!("\r\n");
+                let _ = io::stdout().flush();
                 self.redraw_prompt();
                 Some(submitted)
             }
@@ -622,5 +622,34 @@ mod tests {
     fn cli_demo_incoming_ms_uses_flag_value() {
         let args = ClientArgs::parse_from(["darkwire", "--demo-incoming-ms", "200"]);
         assert_eq!(args.demo_incoming_ms, Some(200));
+    }
+
+    #[test]
+    fn terminal_ui_enter_submits_buffer_without_losing_text() {
+        let mut ui = TerminalUi::new(false);
+
+        assert_eq!(
+            ui.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            ui.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+            None
+        );
+
+        let submitted = ui.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(submitted.as_deref(), Some("hi"));
+        assert!(ui.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn terminal_ui_backspace_edits_buffer() {
+        let mut ui = TerminalUi::new(false);
+        let _ = ui.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let _ = ui.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        let _ = ui.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        let submitted = ui.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(submitted.as_deref(), Some("a"));
     }
 }
