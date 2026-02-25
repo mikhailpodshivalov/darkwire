@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+crossterm.workspace = true
 darkwire-protocol = { path = "../darkwire-protocol" }
 futures-util.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
