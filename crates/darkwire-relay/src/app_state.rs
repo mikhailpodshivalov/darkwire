@@ -1,4 +1,8 @@
 use crate::{
+    handshake_store::{
+        ConsumeSelectionError, HandshakeStore, PendingHandshake, PrekeySelection,
+        TakeHandshakeError,
+    },
     invite_store::{InviteConsumeError, InviteRecord, InviteStore},
     prekey_store::{OpkRecord, PrekeyStore, SpkRecord},
     rate_limit::{RateLimitHit, RateLimitStore},
@@ -7,8 +11,9 @@ use crate::{
 use darkwire_protocol::{
     config::LimitsConfig,
     events::{
-        InviteCreateRequest, InviteUseRequest, OneTimePrekey, PrekeyGetRequest,
-        PrekeyPublishRequest, PublicPrekeyBundle, SessionEndReason, SignedPrekey,
+        HandshakeAcceptRecvEvent, HandshakeAcceptRequest, HandshakeInitRecvEvent,
+        HandshakeInitRequest, InviteCreateRequest, InviteUseRequest, OneTimePrekey,
+        PrekeyGetRequest, PrekeyPublishRequest, PublicPrekeyBundle, SessionEndReason, SignedPrekey,
     },
     invite::{decode_invite, encode_invite, InvitePayloadV1, INVITE_VERSION, TOKEN_MAX_LEN},
 };
@@ -16,7 +21,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
@@ -80,6 +85,9 @@ pub enum HandshakeFailureReason {
     NoActiveSession,
     SessionMismatch,
     PrekeyNotFound,
+    StateConflict,
+    HandshakeInvalid,
+    HandshakeTimeout,
     UnsupportedEvent,
 }
 
@@ -90,6 +98,9 @@ impl HandshakeFailureReason {
             HandshakeFailureReason::NoActiveSession => "no_active_session",
             HandshakeFailureReason::SessionMismatch => "session_mismatch",
             HandshakeFailureReason::PrekeyNotFound => "prekey_not_found",
+            HandshakeFailureReason::StateConflict => "state_conflict",
+            HandshakeFailureReason::HandshakeInvalid => "handshake_invalid",
+            HandshakeFailureReason::HandshakeTimeout => "handshake_timeout",
             HandshakeFailureReason::UnsupportedEvent => "unsupported_event",
         }
     }
@@ -105,6 +116,20 @@ pub struct PrekeyPublished {
 pub struct PrekeyBundleRoute {
     pub session_id: SessionId,
     pub peer: PublicPrekeyBundle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandshakeInitRoute {
+    pub session_id: SessionId,
+    pub peer_conn: ConnId,
+    pub event: HandshakeInitRecvEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandshakeAcceptRoute {
+    pub session_id: SessionId,
+    pub peer_conn: ConnId,
+    pub event: HandshakeAcceptRecvEvent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +171,25 @@ pub enum PrekeyGetError {
     PrekeyNotFound,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandshakeInitError {
+    RateLimited(RateLimitHit),
+    InvalidRequest,
+    NoActiveSession,
+    SessionMismatch,
+    PrekeySelectionMissing,
+    StateConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandshakeAcceptError {
+    RateLimited(RateLimitHit),
+    InvalidRequest,
+    NoActiveSession,
+    SessionMismatch,
+    StateConflict,
+}
+
 #[derive(Debug)]
 pub struct AppState {
     limits: LimitsConfig,
@@ -153,6 +197,7 @@ pub struct AppState {
     invites: InviteStore,
     rate_limits: RateLimitStore,
     prekeys: RwLock<PrekeyStore>,
+    handshakes: RwLock<HandshakeStore>,
     sessions: RwLock<SessionStore>,
     handshake_failures: RwLock<HashMap<HandshakeFailureReason, u64>>,
 }
@@ -165,6 +210,7 @@ impl AppState {
             invites: InviteStore::new(),
             rate_limits: RateLimitStore::new(),
             prekeys: RwLock::new(PrekeyStore::new()),
+            handshakes: RwLock::new(HandshakeStore::new()),
             sessions: RwLock::new(SessionStore::new()),
             handshake_failures: RwLock::new(HashMap::new()),
         }
@@ -235,6 +281,13 @@ impl AppState {
             });
 
         self.prekeys.write().await.remove_bundle(id);
+        self.handshakes.write().await.cleanup_for_conn(id);
+        if let Some(ended) = peer_ended.as_ref() {
+            self.handshakes
+                .write()
+                .await
+                .cleanup_for_session(ended.session_id);
+        }
 
         DisconnectOutcome {
             connection: removed,
@@ -461,6 +514,18 @@ impl AppState {
             .take_peer_bundle(peer_conn)
             .ok_or(PrekeyGetError::PrekeyNotFound)?;
 
+        self.handshakes
+            .write()
+            .await
+            .note_prekey_selection(PrekeySelection {
+                session_id,
+                initiator_conn: conn_id,
+                responder_conn: peer_conn,
+                peer_spk_id: peer_bundle.spk.id,
+                peer_opk_id: peer_bundle.opk.as_ref().map(|opk| opk.id),
+                selected_at: Instant::now(),
+            });
+
         Ok(PrekeyBundleRoute {
             session_id,
             peer: PublicPrekeyBundle {
@@ -479,12 +544,112 @@ impl AppState {
         })
     }
 
+    pub async fn route_handshake_init(
+        &self,
+        initiator_conn: ConnId,
+        ip: IpAddr,
+        req: HandshakeInitRequest,
+    ) -> Result<HandshakeInitRoute, HandshakeInitError> {
+        self.rate_limits
+            .check_handshake(ip, &self.limits)
+            .await
+            .map_err(HandshakeInitError::RateLimited)?;
+
+        validate_handshake_init_request(&req).map_err(|_| HandshakeInitError::InvalidRequest)?;
+
+        let (session_id, responder_conn) = {
+            let sessions = self.sessions.read().await;
+            let (active_session_id, peer_conn) = sessions
+                .peer_for_conn(initiator_conn)
+                .ok_or(HandshakeInitError::NoActiveSession)?;
+            if active_session_id != req.session_id {
+                return Err(HandshakeInitError::SessionMismatch);
+            }
+            (active_session_id, peer_conn)
+        };
+
+        let mut handshakes = self.handshakes.write().await;
+        let _ = handshakes
+            .consume_prekey_selection(
+                session_id,
+                initiator_conn,
+                responder_conn,
+                req.peer_spk_id,
+                req.peer_opk_id,
+            )
+            .map_err(map_prekey_selection_error)?;
+
+        let inserted = handshakes.register_pending_handshake(PendingHandshake {
+            session_id,
+            hs_id: req.hs_id,
+            initiator_conn,
+            responder_conn,
+            peer_spk_id: req.peer_spk_id,
+            peer_opk_id: req.peer_opk_id,
+            created_at: Instant::now(),
+        });
+
+        if !inserted {
+            return Err(HandshakeInitError::StateConflict);
+        }
+
+        Ok(HandshakeInitRoute {
+            session_id,
+            peer_conn: responder_conn,
+            event: req,
+        })
+    }
+
+    pub async fn route_handshake_accept(
+        &self,
+        responder_conn: ConnId,
+        ip: IpAddr,
+        req: HandshakeAcceptRequest,
+    ) -> Result<HandshakeAcceptRoute, HandshakeAcceptError> {
+        self.rate_limits
+            .check_handshake(ip, &self.limits)
+            .await
+            .map_err(HandshakeAcceptError::RateLimited)?;
+
+        validate_handshake_accept_request(&req)
+            .map_err(|_| HandshakeAcceptError::InvalidRequest)?;
+
+        let (session_id, peer_conn) = {
+            let sessions = self.sessions.read().await;
+            let (active_session_id, peer_conn) = sessions
+                .peer_for_conn(responder_conn)
+                .ok_or(HandshakeAcceptError::NoActiveSession)?;
+            if active_session_id != req.session_id {
+                return Err(HandshakeAcceptError::SessionMismatch);
+            }
+            (active_session_id, peer_conn)
+        };
+
+        let pending = self
+            .handshakes
+            .write()
+            .await
+            .take_pending_for_accept(req.hs_id, session_id, responder_conn)
+            .map_err(map_take_handshake_error)?;
+
+        if pending.initiator_conn != peer_conn {
+            return Err(HandshakeAcceptError::StateConflict);
+        }
+
+        Ok(HandshakeAcceptRoute {
+            session_id,
+            peer_conn: pending.initiator_conn,
+            event: req,
+        })
+    }
+
     pub async fn end_session_for_conn(
         &self,
         conn_id: ConnId,
         reason: SessionEndReason,
     ) -> Option<SessionTermination> {
-        self.sessions
+        let ended = self
+            .sessions
             .write()
             .await
             .close_for_conn(conn_id)
@@ -492,7 +657,17 @@ impl AppState {
                 session_id: closed.session_id,
                 peer_conn: closed.peer_conn,
                 reason,
-            })
+            });
+
+        if let Some(session) = ended.as_ref() {
+            self.handshakes
+                .write()
+                .await
+                .cleanup_for_session(session.session_id);
+        }
+
+        self.handshakes.write().await.cleanup_for_conn(conn_id);
+        ended
     }
 
     pub async fn record_handshake_failure(&self, reason: HandshakeFailureReason) {
@@ -597,6 +772,24 @@ fn map_session_create_error(err: SessionCreateError) -> InviteUseError {
     }
 }
 
+fn map_prekey_selection_error(err: ConsumeSelectionError) -> HandshakeInitError {
+    match err {
+        ConsumeSelectionError::NotFound => HandshakeInitError::PrekeySelectionMissing,
+        ConsumeSelectionError::PeerMismatch
+        | ConsumeSelectionError::SpkMismatch
+        | ConsumeSelectionError::OpkMismatch => HandshakeInitError::StateConflict,
+    }
+}
+
+fn map_take_handshake_error(err: TakeHandshakeError) -> HandshakeAcceptError {
+    match err {
+        TakeHandshakeError::NotFound => HandshakeAcceptError::StateConflict,
+        TakeHandshakeError::SessionMismatch | TakeHandshakeError::ResponderMismatch => {
+            HandshakeAcceptError::StateConflict
+        }
+    }
+}
+
 fn validate_prekey_publish(req: &PrekeyPublishRequest) -> Result<(), PrekeyValidationError> {
     if req.ik_ed25519.trim().is_empty() {
         return Err(PrekeyValidationError::MissingIdentityKey);
@@ -623,6 +816,47 @@ fn validate_prekey_publish(req: &PrekeyPublishRequest) -> Result<(), PrekeyValid
     Ok(())
 }
 
+fn validate_handshake_init_request(
+    req: &HandshakeInitRequest,
+) -> Result<(), HandshakeValidationError> {
+    if req.sender_ik_ed25519.trim().is_empty()
+        || req.sender_eph_x25519.trim().is_empty()
+        || req.sig_ed25519.trim().is_empty()
+    {
+        return Err(HandshakeValidationError::MissingFields);
+    }
+
+    if !is_timestamp_within_skew(req.ts_unix, 5 * 60) {
+        return Err(HandshakeValidationError::TimestampOutOfSkew);
+    }
+
+    Ok(())
+}
+
+fn validate_handshake_accept_request(
+    req: &HandshakeAcceptRequest,
+) -> Result<(), HandshakeValidationError> {
+    if req.responder_ik_ed25519.trim().is_empty()
+        || req.responder_eph_x25519.trim().is_empty()
+        || req.sig_ed25519.trim().is_empty()
+        || req.kc.trim().is_empty()
+    {
+        return Err(HandshakeValidationError::MissingFields);
+    }
+
+    Ok(())
+}
+
+fn is_timestamp_within_skew(ts_unix: u64, skew_secs: u64) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let lower = now.saturating_sub(skew_secs);
+    let upper = now.saturating_add(skew_secs);
+    (lower..=upper).contains(&ts_unix)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrekeyValidationError {
     MissingIdentityKey,
@@ -630,6 +864,12 @@ enum PrekeyValidationError {
     InvalidOpk,
     DuplicateOpkId,
     TooManyOpks,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandshakeValidationError {
+    MissingFields,
+    TimestampOutOfSkew,
 }
 
 fn min_interval_for_rate(rate_per_sec: u32) -> Duration {
@@ -657,7 +897,8 @@ fn generate_token(len: usize) -> String {
 mod tests {
     use super::*;
     use darkwire_protocol::events::{
-        InviteCreateRequest, OneTimePrekey, PrekeyGetRequest, PrekeyPublishRequest, SignedPrekey,
+        HandshakeAcceptRequest, HandshakeInitRequest, InviteCreateRequest, OneTimePrekey,
+        PrekeyGetRequest, PrekeyPublishRequest, SignedPrekey,
     };
     use std::net::{IpAddr, Ipv4Addr};
     use tokio::sync::mpsc;
@@ -668,6 +909,13 @@ mod tests {
 
     fn channel() -> (OutboundSender, mpsc::Receiver<String>) {
         mpsc::channel(8)
+    }
+
+    fn now_unix() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     fn sample_prekey_publish(opk_ids: &[u32]) -> PrekeyPublishRequest {
@@ -1083,6 +1331,146 @@ mod tests {
             .await
             .expect_err("duplicate opk ids should fail");
         assert_eq!(err, PrekeyPublishError::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn handshake_init_and_accept_route_between_session_peers() {
+        let state = AppState::new(LimitsConfig::default());
+        let (tx_a, _rx_a) = channel();
+        let (tx_b, _rx_b) = channel();
+        let inviter = state.register_connection(test_ip(50), tx_a).await;
+        let joiner = state.register_connection(test_ip(51), tx_b).await;
+
+        let created = state
+            .create_invite(
+                inviter,
+                test_ip(50),
+                InviteCreateRequest {
+                    r: vec!["ws://127.0.0.1:7000".to_string()],
+                    e: 600,
+                    o: true,
+                },
+            )
+            .await
+            .expect("invite create should pass");
+
+        let session_id = state
+            .use_invite(
+                joiner,
+                test_ip(51),
+                InviteUseRequest {
+                    invite: created.invite,
+                },
+            )
+            .await
+            .expect("invite use should pass")
+            .session_id;
+
+        state
+            .publish_prekeys(inviter, test_ip(50), sample_prekey_publish(&[777]))
+            .await
+            .expect("prekey publish should pass");
+
+        let bundle = state
+            .get_peer_prekey_bundle(joiner, test_ip(51), PrekeyGetRequest { session_id })
+            .await
+            .expect("bundle fetch should pass");
+
+        let hs_id = Uuid::new_v4();
+        let init = HandshakeInitRequest {
+            session_id,
+            hs_id,
+            sender_ik_ed25519: "sender_ik".to_string(),
+            sender_eph_x25519: "sender_eph".to_string(),
+            peer_spk_id: bundle.peer.spk.id,
+            peer_opk_id: bundle.peer.opk.as_ref().map(|opk| opk.id),
+            sig_ed25519: "sender_sig".to_string(),
+            ts_unix: now_unix(),
+        };
+
+        let routed_init = state
+            .route_handshake_init(joiner, test_ip(51), init)
+            .await
+            .expect("handshake init should route");
+        assert_eq!(routed_init.session_id, session_id);
+        assert_eq!(routed_init.peer_conn, inviter);
+
+        let accept = HandshakeAcceptRequest {
+            session_id,
+            hs_id,
+            responder_ik_ed25519: "responder_ik".to_string(),
+            responder_eph_x25519: "responder_eph".to_string(),
+            sig_ed25519: "responder_sig".to_string(),
+            kc: "kc_value".to_string(),
+        };
+
+        let routed_accept = state
+            .route_handshake_accept(inviter, test_ip(50), accept.clone())
+            .await
+            .expect("handshake accept should route");
+        assert_eq!(routed_accept.session_id, session_id);
+        assert_eq!(routed_accept.peer_conn, joiner);
+        assert_eq!(routed_accept.event.hs_id, hs_id);
+
+        let second_accept = state
+            .route_handshake_accept(inviter, test_ip(50), accept)
+            .await
+            .expect_err("second accept for same hs_id should fail");
+        assert_eq!(second_accept, HandshakeAcceptError::StateConflict);
+    }
+
+    #[tokio::test]
+    async fn handshake_init_requires_prekey_selection_first() {
+        let state = AppState::new(LimitsConfig::default());
+        let (tx_a, _rx_a) = channel();
+        let (tx_b, _rx_b) = channel();
+        let inviter = state.register_connection(test_ip(60), tx_a).await;
+        let joiner = state.register_connection(test_ip(61), tx_b).await;
+
+        let created = state
+            .create_invite(
+                inviter,
+                test_ip(60),
+                InviteCreateRequest {
+                    r: vec!["ws://127.0.0.1:7000".to_string()],
+                    e: 600,
+                    o: true,
+                },
+            )
+            .await
+            .expect("invite create should pass");
+
+        let session_id = state
+            .use_invite(
+                joiner,
+                test_ip(61),
+                InviteUseRequest {
+                    invite: created.invite,
+                },
+            )
+            .await
+            .expect("invite use should pass")
+            .session_id;
+
+        let err = state
+            .route_handshake_init(
+                joiner,
+                test_ip(61),
+                HandshakeInitRequest {
+                    session_id,
+                    hs_id: Uuid::new_v4(),
+                    sender_ik_ed25519: "sender_ik".to_string(),
+                    sender_eph_x25519: "sender_eph".to_string(),
+                    peer_spk_id: 7,
+                    peer_opk_id: None,
+                    sig_ed25519: "sender_sig".to_string(),
+                    ts_unix: now_unix(),
+                },
+            )
+            .await
+            .expect_err("handshake init without prekey.get should fail");
+
+        assert_eq!(err, HandshakeInitError::PrekeySelectionMissing);
     }
 
     #[tokio::test]

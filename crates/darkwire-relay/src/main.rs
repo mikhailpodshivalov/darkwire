@@ -1,4 +1,5 @@
 mod app_state;
+mod handshake_store;
 mod invite_store;
 mod logging;
 mod prekey_store;
@@ -67,10 +68,11 @@ fn init_tracing(log_filter: &str) {
 mod tests {
     use super::*;
     use darkwire_protocol::events::{
-        self, Envelope, ErrorCode, ErrorEvent, InviteCreateRequest, InviteCreatedEvent,
-        InviteUseRequest, MsgRecvEvent, MsgSendRequest, OneTimePrekey, PrekeyBundleEvent,
-        PrekeyGetRequest, PrekeyPublishRequest, PrekeyPublishedEvent, RateLimitScope,
-        RateLimitedEvent, SessionEndReason, SessionEndedEvent, SessionStartedEvent, SignedPrekey,
+        self, Envelope, ErrorCode, ErrorEvent, HandshakeAcceptRequest, HandshakeInitRequest,
+        InviteCreateRequest, InviteCreatedEvent, InviteUseRequest, MsgRecvEvent, MsgSendRequest,
+        OneTimePrekey, PrekeyBundleEvent, PrekeyGetRequest, PrekeyPublishRequest,
+        PrekeyPublishedEvent, RateLimitScope, RateLimitedEvent, SessionEndReason,
+        SessionEndedEvent, SessionStartedEvent, SignedPrekey,
     };
     use futures_util::{SinkExt, StreamExt};
     use serde::{Deserialize, Serialize};
@@ -395,35 +397,191 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integration_handshake_unsupported_increments_failure_metric() {
-        let (state, addr, shutdown_tx, server_task) =
-            spawn_test_relay_with_state(LimitsConfig::default()).await;
+    async fn integration_handshake_routes_init_and_accept_between_peers() {
+        let (addr, shutdown_tx, server_task) = spawn_test_relay(LimitsConfig::default()).await;
 
-        let mut client = connect_client(addr).await;
+        let mut inviter = connect_client(addr).await;
+        let mut joiner = connect_client(addr).await;
+
         assert_eq!(
-            recv_with_timeout(&mut client).await.event_type,
+            recv_with_timeout(&mut inviter).await.event_type,
+            events::names::READY
+        );
+        assert_eq!(
+            recv_with_timeout(&mut joiner).await.event_type,
             events::names::READY
         );
 
         send_event(
-            &mut client,
+            &mut inviter,
+            events::names::INVITE_CREATE,
+            "req-create",
+            InviteCreateRequest {
+                r: vec![relay_url(addr)],
+                e: 600,
+                o: true,
+            },
+        )
+        .await;
+        let invite_created = recv_until(&mut inviter, events::names::INVITE_CREATED).await;
+        let invite = serde_json::from_value::<InviteCreatedEvent>(invite_created.data)
+            .expect("invite.created payload should parse")
+            .invite;
+
+        send_event(
+            &mut joiner,
+            events::names::INVITE_USE,
+            "req-join",
+            InviteUseRequest { invite },
+        )
+        .await;
+        let joiner_started = recv_until(&mut joiner, events::names::SESSION_STARTED).await;
+        let session_id = serde_json::from_value::<SessionStartedEvent>(joiner_started.data)
+            .expect("session.started payload should parse")
+            .session_id;
+        let _ = recv_until(&mut inviter, events::names::SESSION_STARTED).await;
+
+        send_event(
+            &mut inviter,
+            events::names::E2E_PREKEY_PUBLISH,
+            "req-publish",
+            sample_prekey_publish(7, &[5001]),
+        )
+        .await;
+        let _ = recv_until(&mut inviter, events::names::E2E_PREKEY_PUBLISHED).await;
+
+        send_event(
+            &mut joiner,
+            events::names::E2E_PREKEY_GET,
+            "req-prekey-get",
+            PrekeyGetRequest { session_id },
+        )
+        .await;
+        let bundle = recv_until(&mut joiner, events::names::E2E_PREKEY_BUNDLE).await;
+        let bundle_payload = serde_json::from_value::<PrekeyBundleEvent>(bundle.data)
+            .expect("prekey.bundle payload should parse");
+
+        let hs_id = uuid::Uuid::new_v4();
+        send_event(
+            &mut joiner,
             events::names::E2E_HANDSHAKE_INIT,
-            "req-hs",
-            serde_json::json!({
-                "session_id": uuid::Uuid::new_v4(),
-                "hs_id": uuid::Uuid::new_v4()
-            }),
+            "req-hs-init",
+            HandshakeInitRequest {
+                session_id,
+                hs_id,
+                sender_ik_ed25519: "sender_ik".to_string(),
+                sender_eph_x25519: "sender_eph".to_string(),
+                peer_spk_id: bundle_payload.peer.spk.id,
+                peer_opk_id: bundle_payload.peer.opk.as_ref().map(|opk| opk.id),
+                sig_ed25519: "sender_sig".to_string(),
+                ts_unix: now_unix(),
+            },
         )
         .await;
 
-        let envelope = recv_with_timeout(&mut client).await;
+        let routed_init = recv_until(&mut inviter, events::names::E2E_HANDSHAKE_INIT_RECV).await;
+        let routed_init_payload = serde_json::from_value::<HandshakeInitRequest>(routed_init.data)
+            .expect("handshake.init.recv payload should parse");
+        assert_eq!(routed_init_payload.session_id, session_id);
+        assert_eq!(routed_init_payload.hs_id, hs_id);
+
+        send_event(
+            &mut inviter,
+            events::names::E2E_HANDSHAKE_ACCEPT,
+            "req-hs-accept",
+            HandshakeAcceptRequest {
+                session_id,
+                hs_id,
+                responder_ik_ed25519: "responder_ik".to_string(),
+                responder_eph_x25519: "responder_eph".to_string(),
+                sig_ed25519: "responder_sig".to_string(),
+                kc: "kc_value".to_string(),
+            },
+        )
+        .await;
+
+        let routed_accept = recv_until(&mut joiner, events::names::E2E_HANDSHAKE_ACCEPT_RECV).await;
+        let routed_accept_payload =
+            serde_json::from_value::<HandshakeAcceptRequest>(routed_accept.data)
+                .expect("handshake.accept.recv payload should parse");
+        assert_eq!(routed_accept_payload.session_id, session_id);
+        assert_eq!(routed_accept_payload.hs_id, hs_id);
+
+        let _ = shutdown_tx.send(());
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn integration_handshake_without_prekey_selection_emits_prekey_not_found_metric() {
+        let (state, addr, shutdown_tx, server_task) =
+            spawn_test_relay_with_state(LimitsConfig::default()).await;
+
+        let mut inviter = connect_client(addr).await;
+        let mut joiner = connect_client(addr).await;
+
+        assert_eq!(
+            recv_with_timeout(&mut inviter).await.event_type,
+            events::names::READY
+        );
+        assert_eq!(
+            recv_with_timeout(&mut joiner).await.event_type,
+            events::names::READY
+        );
+
+        send_event(
+            &mut inviter,
+            events::names::INVITE_CREATE,
+            "req-create",
+            InviteCreateRequest {
+                r: vec![relay_url(addr)],
+                e: 600,
+                o: true,
+            },
+        )
+        .await;
+        let invite_created = recv_until(&mut inviter, events::names::INVITE_CREATED).await;
+        let invite = serde_json::from_value::<InviteCreatedEvent>(invite_created.data)
+            .expect("invite.created payload should parse")
+            .invite;
+
+        send_event(
+            &mut joiner,
+            events::names::INVITE_USE,
+            "req-join",
+            InviteUseRequest { invite },
+        )
+        .await;
+        let started = recv_until(&mut joiner, events::names::SESSION_STARTED).await;
+        let session_id = serde_json::from_value::<SessionStartedEvent>(started.data)
+            .expect("session.started payload should parse")
+            .session_id;
+        let _ = recv_until(&mut inviter, events::names::SESSION_STARTED).await;
+
+        send_event(
+            &mut joiner,
+            events::names::E2E_HANDSHAKE_INIT,
+            "req-hs",
+            HandshakeInitRequest {
+                session_id,
+                hs_id: uuid::Uuid::new_v4(),
+                sender_ik_ed25519: "sender_ik".to_string(),
+                sender_eph_x25519: "sender_eph".to_string(),
+                peer_spk_id: 7,
+                peer_opk_id: None,
+                sig_ed25519: "sender_sig".to_string(),
+                ts_unix: now_unix(),
+            },
+        )
+        .await;
+
+        let envelope = recv_with_timeout(&mut joiner).await;
         assert_eq!(envelope.event_type, events::names::ERROR);
         let payload = serde_json::from_value::<ErrorEvent>(envelope.data)
             .expect("error payload should parse");
-        assert_eq!(payload.code, ErrorCode::HandshakeInvalid);
+        assert_eq!(payload.code, ErrorCode::PrekeyNotFound);
 
         let failures = state
-            .handshake_failure_count(app_state::HandshakeFailureReason::UnsupportedEvent)
+            .handshake_failure_count(app_state::HandshakeFailureReason::PrekeyNotFound)
             .await;
         assert_eq!(failures, 1);
 
@@ -543,6 +701,13 @@ mod tests {
 
     fn relay_url(addr: SocketAddr) -> String {
         format!("ws://{addr}/ws")
+    }
+
+    fn now_unix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     fn sample_prekey_publish(spk_id: u32, opk_ids: &[u32]) -> PrekeyPublishRequest {

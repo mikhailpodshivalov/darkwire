@@ -20,6 +20,8 @@ pub mod names {
     pub const SESSION_ENDED: &str = "session.ended";
     pub const E2E_PREKEY_PUBLISHED: &str = "e2e.prekey.published";
     pub const E2E_PREKEY_BUNDLE: &str = "e2e.prekey.bundle";
+    pub const E2E_HANDSHAKE_INIT_RECV: &str = "e2e.handshake.init.recv";
+    pub const E2E_HANDSHAKE_ACCEPT_RECV: &str = "e2e.handshake.accept.recv";
     pub const RATE_LIMITED: &str = "rate.limited";
     pub const ERROR: &str = "error";
     pub const PONG: &str = "pong";
@@ -98,6 +100,32 @@ pub struct PrekeyPublishRequest {
 pub struct PrekeyGetRequest {
     pub session_id: Uuid,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HandshakeInitRequest {
+    pub session_id: Uuid,
+    pub hs_id: Uuid,
+    pub sender_ik_ed25519: String,
+    pub sender_eph_x25519: String,
+    pub peer_spk_id: u32,
+    pub peer_opk_id: Option<u32>,
+    pub sig_ed25519: String,
+    pub ts_unix: u64,
+}
+
+pub type HandshakeInitRecvEvent = HandshakeInitRequest;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HandshakeAcceptRequest {
+    pub session_id: Uuid,
+    pub hs_id: Uuid,
+    pub responder_ik_ed25519: String,
+    pub responder_eph_x25519: String,
+    pub sig_ed25519: String,
+    pub kc: String,
+}
+
+pub type HandshakeAcceptRecvEvent = HandshakeAcceptRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadyEvent {

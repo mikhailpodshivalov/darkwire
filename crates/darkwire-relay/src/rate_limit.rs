@@ -18,6 +18,7 @@ struct IpRateState {
     use_min: VecDeque<Instant>,
     prekey_publish_min: VecDeque<Instant>,
     prekey_get_min: VecDeque<Instant>,
+    handshake_min: VecDeque<Instant>,
     failed_invite_uses: u32,
     backoff_until: Option<Instant>,
 }
@@ -71,6 +72,14 @@ impl RateLimitStore {
         limits: &LimitsConfig,
     ) -> Result<(), RateLimitHit> {
         self.check_prekey_get_at(ip, limits, Instant::now()).await
+    }
+
+    pub async fn check_handshake(
+        &self,
+        ip: IpAddr,
+        limits: &LimitsConfig,
+    ) -> Result<(), RateLimitHit> {
+        self.check_handshake_at(ip, limits, Instant::now()).await
     }
 
     async fn check_invite_create_at(
@@ -209,6 +218,29 @@ impl RateLimitStore {
         }
 
         state.prekey_get_min.push_back(now);
+        Ok(())
+    }
+
+    async fn check_handshake_at(
+        &self,
+        ip: IpAddr,
+        limits: &LimitsConfig,
+        now: Instant,
+    ) -> Result<(), RateLimitHit> {
+        let mut by_ip = self.by_ip.lock().await;
+        let state = by_ip.entry(ip).or_default();
+
+        prune_window(&mut state.handshake_min, Duration::from_secs(60), now);
+        if let Some(retry_after) = retry_after_window(
+            &state.handshake_min,
+            limits.handshake_per_min,
+            Duration::from_secs(60),
+            now,
+        ) {
+            return Err(RateLimitHit { retry_after });
+        }
+
+        state.handshake_min.push_back(now);
         Ok(())
     }
 }
@@ -396,5 +428,29 @@ mod tests {
             .await
             .expect_err("second get should be rate limited");
         assert!(err.retry_after >= Duration::from_secs(58));
+    }
+
+    #[tokio::test]
+    async fn handshake_respects_per_minute_limit() {
+        let mut limits = LimitsConfig::default();
+        limits.handshake_per_min = 2;
+
+        let store = RateLimitStore::new();
+        let now = Instant::now();
+
+        store
+            .check_handshake_at(ip(), &limits, now)
+            .await
+            .expect("first handshake should pass");
+        store
+            .check_handshake_at(ip(), &limits, now + Duration::from_secs(1))
+            .await
+            .expect("second handshake should pass");
+
+        let err = store
+            .check_handshake_at(ip(), &limits, now + Duration::from_secs(2))
+            .await
+            .expect_err("third handshake should be rate limited");
+        assert!(err.retry_after >= Duration::from_secs(57));
     }
 }
