@@ -132,6 +132,7 @@ After `session.started` on both sides, type text lines to chat.
 - `--relay <ws://.../ws|wss://.../ws>` (`DARKWIRE_RELAY_WS`), default `wss://srv1418428.hstgr.cloud/ws`
 - `--invite-relay <ws://.../ws>` (`DARKWIRE_INVITE_RELAY`), default = value of `--relay`
 - `--invite-ttl <seconds>` (`DARKWIRE_INVITE_TTL`), default `600` (range `1..=86400`)
+- `--demo-incoming-ms <ms>` (`DARKWIRE_DEMO_INCOMING_MS`), optional simulated incoming events for terminal UI stress test (range `50..=60000`)
 
 ## Demo scenario (manual)
 1. Start relay.
@@ -141,6 +142,13 @@ After `session.started` on both sides, type text lines to chat.
 5. Close client B (`/q` or Ctrl+C): client A receives `session.ended` with `peer_disconnect`.
 6. To rotate compromised invite, run `/new` in client A and share new code.
 7. To reconnect, use `/c` again with a fresh invite.
+
+## Terminal input stress demo
+To verify incoming events do not break your current input line:
+```bash
+darkwire --relay ws://127.0.0.1:7000/ws --demo-incoming-ms 200
+```
+Then type a long line while demo messages are arriving.
 
 ## Smoke test
 Run end-to-end smoke checks:

@@ -1,4 +1,8 @@
 use clap::Parser;
+use crossterm::{
+    event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 use darkwire_protocol::events::{
     self, Envelope, ErrorEvent, InviteCreateRequest, InviteCreatedEvent, InviteUseRequest,
     MsgRecvEvent, MsgSendRequest, RateLimitedEvent, ReadyEvent, SessionEndReason,
@@ -6,8 +10,17 @@ use darkwire_protocol::events::{
 };
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::error::Error;
-use tokio::{io::AsyncBufReadExt, io::BufReader, net::TcpStream};
+use std::{
+    error::Error,
+    io::{self, IsTerminal, Write},
+};
+use tokio::{
+    io::AsyncBufReadExt,
+    io::BufReader,
+    net::TcpStream,
+    sync::mpsc,
+    time::{self, Duration, MissedTickBehavior},
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 const DEFAULT_RELAY_WS: &str = "wss://srv1418428.hstgr.cloud/ws";
@@ -29,6 +42,12 @@ struct ClientArgs {
         value_parser = clap::value_parser!(u32).range(1..=86_400)
     )]
     invite_ttl: u32,
+    #[arg(
+        long,
+        env = "DARKWIRE_DEMO_INCOMING_MS",
+        value_parser = clap::value_parser!(u64).range(50..=60_000)
+    )]
+    demo_incoming_ms: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -56,6 +75,116 @@ enum UserCommand {
     Unknown,
 }
 
+#[derive(Debug)]
+struct TerminalUi {
+    interactive: bool,
+    input_buffer: String,
+}
+
+impl TerminalUi {
+    fn new(interactive: bool) -> Self {
+        Self {
+            interactive,
+            input_buffer: String::new(),
+        }
+    }
+
+    fn print_line(&mut self, line: &str) {
+        if self.interactive {
+            self.clear_line();
+            println!("{line}");
+            self.redraw_prompt();
+            return;
+        }
+
+        println!("{line}");
+    }
+
+    fn print_error(&mut self, line: &str) {
+        if self.interactive {
+            self.clear_line();
+            eprintln!("{line}");
+            self.redraw_prompt();
+            return;
+        }
+
+        eprintln!("{line}");
+    }
+
+    fn redraw_prompt(&self) {
+        if !self.interactive {
+            return;
+        }
+
+        print!("\r\x1b[2K> {}", self.input_buffer);
+        let _ = io::stdout().flush();
+    }
+
+    fn clear_line(&self) {
+        if !self.interactive {
+            return;
+        }
+
+        print!("\r\x1b[2K");
+        let _ = io::stdout().flush();
+    }
+
+    fn handle_key_event(&mut self, key: KeyEvent) -> Option<String> {
+        if key.kind == KeyEventKind::Release {
+            return None;
+        }
+
+        match key.code {
+            KeyCode::Enter => {
+                let submitted = std::mem::take(&mut self.input_buffer);
+                self.clear_line();
+                println!();
+                self.redraw_prompt();
+                Some(submitted)
+            }
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+                self.redraw_prompt();
+                None
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some("/q".to_string())
+            }
+            KeyCode::Char(ch) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    return None;
+                }
+
+                self.input_buffer.push(ch);
+                self.redraw_prompt();
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn activate(enabled: bool) -> io::Result<Option<Self>> {
+        if !enabled {
+            return Ok(None);
+        }
+
+        enable_raw_mode()?;
+        Ok(Some(Self))
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        print!("\r\x1b[2K");
+        let _ = io::stdout().flush();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider();
@@ -64,13 +193,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let relay_ws = args.relay.clone();
     let invite_relay = resolve_invite_relay(&args);
     let invite_ttl = args.invite_ttl;
+    let interactive_stdin = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let _raw_mode_guard = RawModeGuard::activate(interactive_stdin)?;
+    let mut ui = TerminalUi::new(interactive_stdin);
+    let demo_enabled = args.demo_incoming_ms.is_some();
+    let mut demo_rx = spawn_demo_incoming(args.demo_incoming_ms);
 
-    println!("Connecting to {relay_ws} ...");
+    ui.print_line(&format!("Connecting to {relay_ws} ..."));
     let (ws_stream, _) = connect_async(relay_ws.as_str()).await?;
-    println!("Connected. Commands: /new, /c CODE, /q (/i alias)");
+    ui.print_line("Connected. Commands: /new, /c CODE, /q (/i alias)");
 
     let (mut ws_writer, mut ws_reader) = ws_stream.split();
     let mut stdin_lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut key_events = EventStream::new();
 
     let mut state = ClientState::default();
     let mut request_counter = 1_u64;
@@ -81,10 +216,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &mut request_counter,
     )
     .await?;
+    ui.redraw_prompt();
 
     loop {
         tokio::select! {
-            line = stdin_lines.next_line() => {
+            line = stdin_lines.next_line(), if !interactive_stdin => {
                 let Some(line) = line? else {
                     break;
                 };
@@ -93,6 +229,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     &line,
                     &mut ws_writer,
                     &mut state,
+                    &mut ui,
+                    &invite_relay,
+                    invite_ttl,
+                    &mut request_counter,
+                ).await?;
+
+                if !keep_running {
+                    break;
+                }
+            }
+            maybe_key_event = key_events.next(), if interactive_stdin => {
+                let Some(Ok(Event::Key(key))) = maybe_key_event else {
+                    continue;
+                };
+
+                let Some(line) = ui.handle_key_event(key) else {
+                    continue;
+                };
+
+                let keep_running = handle_user_input(
+                    &line,
+                    &mut ws_writer,
+                    &mut state,
+                    &mut ui,
                     &invite_relay,
                     invite_ttl,
                     &mut request_counter,
@@ -105,35 +265,65 @@ async fn main() -> Result<(), Box<dyn Error>> {
             incoming = ws_reader.next() => {
                 match incoming {
                     Some(Ok(Message::Text(raw))) => {
-                        handle_server_text(raw.as_ref(), &mut state);
+                        if let Some(line) = handle_server_text(raw.as_ref(), &mut state) {
+                            ui.print_line(&line);
+                        }
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         ws_writer.send(Message::Pong(payload)).await?;
                     }
                     Some(Ok(Message::Close(frame))) => {
                         if let Some(frame) = frame {
-                            println!("Server closed connection: {}", frame.reason);
+                            ui.print_line(&format!("Server closed connection: {}", frame.reason));
                         } else {
-                            println!("Server closed connection");
+                            ui.print_line("Server closed connection");
                         }
                         break;
                     }
                     Some(Ok(_)) => {}
                     Some(Err(err)) => {
-                        eprintln!("WebSocket error: {err}");
+                        ui.print_error(&format!("WebSocket error: {err}"));
                         break;
                     }
                     None => {
-                        println!("Connection closed");
+                        ui.print_line("Connection closed");
                         break;
                     }
                 }
             }
+            Some(simulated) = demo_rx.recv(), if demo_enabled => {
+                ui.print_line(&simulated);
+            }
         }
     }
 
+    ui.clear_line();
     let _ = ws_writer.send(Message::Close(None)).await;
     Ok(())
+}
+
+fn spawn_demo_incoming(interval_ms: Option<u64>) -> mpsc::UnboundedReceiver<String> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let Some(interval_ms) = interval_ms else {
+        return rx;
+    };
+
+    tokio::spawn(async move {
+        let mut counter = 1_u64;
+        let mut interval = time::interval(Duration::from_millis(interval_ms));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            let line = format!("[demo] simulated incoming message #{counter}");
+            if tx.send(line).is_err() {
+                break;
+            }
+            counter = counter.saturating_add(1);
+        }
+    });
+
+    rx
 }
 
 fn install_rustls_crypto_provider() {
@@ -145,6 +335,7 @@ async fn handle_user_input(
     line: &str,
     ws_writer: &mut WsWriter,
     state: &mut ClientState,
+    ui: &mut TerminalUi,
     invite_relay: &str,
     invite_ttl: u32,
     request_counter: &mut u64,
@@ -152,7 +343,7 @@ async fn handle_user_input(
     match parse_user_command(line) {
         UserCommand::Ignore => Ok(true),
         UserCommand::Unknown => {
-            println!("Unknown command. Use /new, /c CODE, /q");
+            ui.print_line("Unknown command. Use /new, /c CODE, /q");
             Ok(true)
         }
         UserCommand::Quit => {
@@ -165,7 +356,7 @@ async fn handle_user_input(
                 )
                 .await?;
             }
-            println!("Bye");
+            ui.print_line("Bye");
             Ok(false)
         }
         UserCommand::CreateInvite => {
@@ -185,7 +376,7 @@ async fn handle_user_input(
         }
         UserCommand::SendMessage(text) => {
             if !state.active_session {
-                println!("No active session. Use /new or /c CODE");
+                ui.print_line("No active session. Use /new or /c CODE");
                 return Ok(true);
             }
 
@@ -232,12 +423,11 @@ async fn send_request<T: Serialize>(
     Ok(())
 }
 
-fn handle_server_text(raw: &str, state: &mut ClientState) {
+fn handle_server_text(raw: &str, state: &mut ClientState) -> Option<String> {
     let envelope: IncomingEnvelope = match serde_json::from_str(raw) {
         Ok(envelope) => envelope,
         Err(_) => {
-            eprintln!("Received invalid JSON from server");
-            return;
+            return Some("Received invalid JSON from server".to_string());
         }
     };
 
@@ -246,61 +436,63 @@ fn handle_server_text(raw: &str, state: &mut ClientState) {
     match envelope.event_type.as_str() {
         events::names::READY => {
             if let Ok(event) = serde_json::from_value::<ReadyEvent>(envelope.data) {
-                println!("[ready:{rid}] server_time={}", event.server_time);
+                return Some(format!("[ready:{rid}] server_time={}", event.server_time));
             }
         }
         events::names::INVITE_CREATED => {
             if let Ok(event) = serde_json::from_value::<InviteCreatedEvent>(envelope.data) {
-                println!("[invite:{rid}] {}", event.invite);
+                return Some(format!("[invite:{rid}] {}", event.invite));
             }
         }
         events::names::INVITE_USED => {
-            println!("[invite:{rid}] accepted");
+            return Some(format!("[invite:{rid}] accepted"));
         }
         events::names::SESSION_STARTED => {
             if let Ok(event) = serde_json::from_value::<SessionStartedEvent>(envelope.data) {
                 state.active_session = true;
-                println!("[session:{rid}] started id={}", event.session_id);
+                return Some(format!("[session:{rid}] started id={}", event.session_id));
             }
         }
         events::names::MSG_RECV => {
             if let Ok(event) = serde_json::from_value::<MsgRecvEvent>(envelope.data) {
-                println!("peer> {}", event.text);
+                return Some(format!("peer> {}", event.text));
             }
         }
         events::names::SESSION_ENDED => {
             if let Ok(event) = serde_json::from_value::<SessionEndedEvent>(envelope.data) {
                 state.active_session = false;
-                println!(
+                return Some(format!(
                     "[session:{rid}] ended reason={}",
                     session_end_reason_name(event.reason)
-                );
+                ));
             }
         }
         events::names::RATE_LIMITED => {
             if let Ok(event) = serde_json::from_value::<RateLimitedEvent>(envelope.data) {
-                println!(
+                return Some(format!(
                     "[rate:{rid}] scope={} retry_after_ms={}",
                     rate_limit_scope_name(event.scope),
                     event.retry_after_ms
-                );
+                ));
             }
         }
         events::names::ERROR => {
             if let Ok(event) = serde_json::from_value::<ErrorEvent>(envelope.data) {
-                println!(
+                return Some(format!(
                     "[error:{rid}] code={:?} message={}",
                     event.code, event.message
-                );
+                ));
             }
         }
         events::names::PONG => {
             let _ = envelope.data;
         }
         _ => {
-            println!("[event:{rid}] {}", envelope.event_type);
+            return Some(format!("[event:{rid}] {}", envelope.event_type));
         }
     }
+
+    None
 }
 
 fn parse_user_command(line: &str) -> UserCommand {
@@ -405,6 +597,7 @@ mod tests {
         assert_eq!(args.relay, DEFAULT_RELAY_WS);
         assert_eq!(args.invite_relay, None);
         assert_eq!(args.invite_ttl, DEFAULT_INVITE_TTL);
+        assert_eq!(args.demo_incoming_ms, None);
     }
 
     #[test]
@@ -423,5 +616,11 @@ mod tests {
             "ws://127.0.0.1:8888/ws",
         ]);
         assert_eq!(resolve_invite_relay(&args), "ws://127.0.0.1:8888/ws");
+    }
+
+    #[test]
+    fn cli_demo_incoming_ms_uses_flag_value() {
+        let args = ClientArgs::parse_from(["darkwire", "--demo-incoming-ms", "200"]);
+        assert_eq!(args.demo_incoming_ms, Some(200));
     }
 }
