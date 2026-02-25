@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::path::PathBuf;
 
 pub const DEFAULT_RELAY_WS: &str = "wss://srv1418428.hstgr.cloud/ws";
 pub const DEFAULT_INVITE_TTL: u32 = 10 * 60;
@@ -23,6 +24,8 @@ pub struct ClientArgs {
         value_parser = clap::value_parser!(u64).range(50..=60_000)
     )]
     pub demo_incoming_ms: Option<u64>,
+    #[arg(long, env = "DARKWIRE_KEY_FILE")]
+    pub key_file: Option<PathBuf>,
 }
 
 pub fn resolve_invite_relay(args: &ClientArgs) -> String {
@@ -42,6 +45,7 @@ mod tests {
         assert_eq!(args.invite_relay, None);
         assert_eq!(args.invite_ttl, DEFAULT_INVITE_TTL);
         assert_eq!(args.demo_incoming_ms, None);
+        assert_eq!(args.key_file, None);
     }
 
     #[test]
@@ -66,5 +70,14 @@ mod tests {
     fn cli_demo_incoming_ms_uses_flag_value() {
         let args = ClientArgs::parse_from(["darkwire", "--demo-incoming-ms", "200"]);
         assert_eq!(args.demo_incoming_ms, Some(200));
+    }
+
+    #[test]
+    fn cli_key_file_uses_flag_value() {
+        let args = ClientArgs::parse_from(["darkwire", "--key-file", "/tmp/darkwire-keys.json"]);
+        assert_eq!(
+            args.key_file.as_deref(),
+            Some(std::path::Path::new("/tmp/darkwire-keys.json"))
+        );
     }
 }

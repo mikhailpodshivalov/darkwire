@@ -1,6 +1,6 @@
 use darkwire_protocol::events::{
-    self, ErrorEvent, InviteCreatedEvent, MsgRecvEvent, RateLimitedEvent, ReadyEvent,
-    SessionEndReason, SessionEndedEvent, SessionStartedEvent,
+    self, ErrorEvent, InviteCreatedEvent, MsgRecvEvent, PrekeyBundleEvent, PrekeyPublishedEvent,
+    RateLimitedEvent, ReadyEvent, SessionEndReason, SessionEndedEvent, SessionStartedEvent,
 };
 use serde::Deserialize;
 
@@ -47,6 +47,27 @@ pub fn handle_server_text(raw: &str, state: &mut ClientState) -> Option<String> 
             if let Ok(event) = serde_json::from_value::<SessionStartedEvent>(envelope.data) {
                 state.active_session = true;
                 return Some(format!("[session:{rid}] started id={}", event.session_id));
+            }
+        }
+        events::names::E2E_PREKEY_PUBLISHED => {
+            if let Ok(event) = serde_json::from_value::<PrekeyPublishedEvent>(envelope.data) {
+                return Some(format!(
+                    "[keys:{rid}] published spk_id={} opk_count={}",
+                    event.spk_id, event.opk_count
+                ));
+            }
+        }
+        events::names::E2E_PREKEY_BUNDLE => {
+            if let Ok(event) = serde_json::from_value::<PrekeyBundleEvent>(envelope.data) {
+                return Some(format!(
+                    "[e2e:{rid}] peer_bundle session_id={} opk={}",
+                    event.session_id,
+                    if event.peer.opk.is_some() {
+                        "present"
+                    } else {
+                        "none"
+                    }
+                ));
             }
         }
         events::names::MSG_RECV => {
