@@ -11,6 +11,7 @@ pub struct ClientState {
     pub active_session: bool,
     pub active_session_id: Option<Uuid>,
     pub secure_active: bool,
+    pub should_initiate_handshake: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +96,7 @@ pub fn handle_server_text(raw: &str, state: &mut ClientState) -> Option<String> 
                 state.active_session = true;
                 state.active_session_id = Some(event.session_id);
                 state.secure_active = false;
+                state.should_initiate_handshake = envelope.request_id.is_some();
                 return Some(format!("[session:{rid}] started id={}", event.session_id));
             }
         }
@@ -148,6 +150,7 @@ pub fn handle_server_text(raw: &str, state: &mut ClientState) -> Option<String> 
                 state.active_session = false;
                 state.active_session_id = None;
                 state.secure_active = false;
+                state.should_initiate_handshake = false;
                 return Some(format!(
                     "[session:{rid}] ended reason={}",
                     session_end_reason_name(event.reason)
@@ -198,5 +201,46 @@ fn rate_limit_scope_name(scope: darkwire_protocol::events::RateLimitScope) -> &'
         darkwire_protocol::events::RateLimitScope::PrekeyPublish => "prekey_publish",
         darkwire_protocol::events::RateLimitScope::PrekeyGet => "prekey_get",
         darkwire_protocol::events::RateLimitScope::Handshake => "handshake",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use darkwire_protocol::events::{Envelope, SessionStartedEvent};
+
+    #[test]
+    fn session_started_with_request_id_marks_local_initiator() {
+        let mut state = ClientState::default();
+        let raw = serde_json::to_string(
+            &Envelope::new(
+                events::names::SESSION_STARTED,
+                SessionStartedEvent {
+                    session_id: Uuid::new_v4(),
+                    peer: "anon".to_string(),
+                },
+            )
+            .with_request_id("cli-3"),
+        )
+        .expect("serialize envelope");
+
+        let _ = handle_server_text(&raw, &mut state);
+        assert!(state.should_initiate_handshake);
+    }
+
+    #[test]
+    fn session_started_without_request_id_waits_for_peer_handshake() {
+        let mut state = ClientState::default();
+        let raw = serde_json::to_string(&Envelope::new(
+            events::names::SESSION_STARTED,
+            SessionStartedEvent {
+                session_id: Uuid::new_v4(),
+                peer: "anon".to_string(),
+            },
+        ))
+        .expect("serialize envelope");
+
+        let _ = handle_server_text(&raw, &mut state);
+        assert!(!state.should_initiate_handshake);
     }
 }

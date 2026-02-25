@@ -53,11 +53,18 @@ pub async fn handle_wire_action(
     match action {
         WireAction::SessionStarted { session_id } => {
             bootstrap.clear();
-            request_prekey_bundle(ws_writer, session_id, request_counter).await?;
-            ui.print_line(&format!(
-                "[e2e] session {} paired; requesting peer prekey bundle",
-                session_id
-            ));
+            if state.should_initiate_handshake {
+                request_prekey_bundle(ws_writer, session_id, request_counter).await?;
+                ui.print_line(&format!(
+                    "[e2e] session {} paired; requesting peer prekey bundle",
+                    session_id
+                ));
+            } else {
+                ui.print_line(&format!(
+                    "[e2e] session {} paired; waiting for peer handshake.init",
+                    session_id
+                ));
+            }
         }
         WireAction::SessionEnded => {
             bootstrap.clear();
