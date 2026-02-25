@@ -48,7 +48,8 @@ impl TerminalUi {
         }
 
         self.clear_rendered_prompt();
-        print!("> {}", self.input_buffer);
+        // Always start prompt from column 0 even if cursor drifted after wrapped output.
+        print!("\r> {}", self.input_buffer);
         let _ = io::stdout().flush();
         self.rendered_prompt_rows = prompt_rows(&self.input_buffer);
     }
