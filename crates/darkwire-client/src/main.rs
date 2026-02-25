@@ -102,11 +102,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             maybe_key_event = key_events.next(), if interactive_stdin => {
-                let Some(Ok(Event::Key(key))) = maybe_key_event else {
+                let Some(Ok(event)) = maybe_key_event else {
                     continue;
                 };
 
-                let Some(line) = ui.handle_key_event(key) else {
+                let maybe_line = match event {
+                    Event::Key(key) => ui.handle_key_event(key),
+                    Event::Paste(text) => {
+                        ui.handle_paste(&text);
+                        None
+                    }
+                    _ => None,
+                };
+
+                let Some(line) = maybe_line else {
                     continue;
                 };
 

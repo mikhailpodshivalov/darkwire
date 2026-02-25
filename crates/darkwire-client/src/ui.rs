@@ -1,6 +1,6 @@
 use crossterm::{
     event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, size},
 };
 use std::io::{self, Write};
 
@@ -8,6 +8,7 @@ use std::io::{self, Write};
 pub struct TerminalUi {
     interactive: bool,
     input_buffer: String,
+    rendered_prompt_rows: usize,
 }
 
 impl TerminalUi {
@@ -15,12 +16,13 @@ impl TerminalUi {
         Self {
             interactive,
             input_buffer: String::new(),
+            rendered_prompt_rows: 0,
         }
     }
 
     pub fn print_line(&mut self, line: &str) {
         if self.interactive {
-            self.clear_line();
+            self.clear_rendered_prompt();
             println!("{line}");
             self.redraw_prompt();
             return;
@@ -31,7 +33,7 @@ impl TerminalUi {
 
     pub fn print_error(&mut self, line: &str) {
         if self.interactive {
-            self.clear_line();
+            self.clear_rendered_prompt();
             eprintln!("{line}");
             self.redraw_prompt();
             return;
@@ -40,21 +42,23 @@ impl TerminalUi {
         eprintln!("{line}");
     }
 
-    pub fn redraw_prompt(&self) {
+    pub fn redraw_prompt(&mut self) {
         if !self.interactive {
             return;
         }
 
-        print!("\r\x1b[2K> {}", self.input_buffer);
+        self.clear_rendered_prompt();
+        print!("> {}", self.input_buffer);
         let _ = io::stdout().flush();
+        self.rendered_prompt_rows = prompt_rows(&self.input_buffer);
     }
 
-    pub fn clear_line(&self) {
+    pub fn clear_line(&mut self) {
         if !self.interactive {
             return;
         }
 
-        print!("\r\x1b[2K");
+        self.clear_rendered_prompt();
         let _ = io::stdout().flush();
     }
 
@@ -91,6 +95,35 @@ impl TerminalUi {
             _ => None,
         }
     }
+
+    pub fn handle_paste(&mut self, text: &str) {
+        for ch in text.chars() {
+            if ch == '\r' || ch == '\n' {
+                continue;
+            }
+            if ch.is_control() {
+                continue;
+            }
+            self.input_buffer.push(ch);
+        }
+
+        if self.interactive {
+            self.redraw_prompt();
+        }
+    }
+
+    fn clear_rendered_prompt(&mut self) {
+        if !self.interactive || self.rendered_prompt_rows == 0 {
+            return;
+        }
+
+        print!("\r\x1b[2K");
+        for _ in 1..self.rendered_prompt_rows {
+            print!("\x1b[1A\r\x1b[2K");
+        }
+        print!("\r");
+        self.rendered_prompt_rows = 0;
+    }
 }
 
 pub struct RawModeGuard;
@@ -112,6 +145,18 @@ impl Drop for RawModeGuard {
         print!("\r\x1b[2K");
         let _ = io::stdout().flush();
     }
+}
+
+fn prompt_rows(input: &str) -> usize {
+    let width = size()
+        .map(|(cols, _)| cols as usize)
+        .ok()
+        .filter(|cols| *cols > 0)
+        .unwrap_or(80);
+
+    let prompt_len = 2 + input.chars().count();
+    let used_cells = prompt_len.max(1);
+    ((used_cells - 1) / width) + 1
 }
 
 #[cfg(test)]
@@ -145,5 +190,21 @@ mod tests {
 
         let submitted = ui.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(submitted.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn terminal_ui_paste_appends_text_without_newlines() {
+        let mut ui = TerminalUi::new(false);
+        ui.handle_paste("ab\ncd\r\nef");
+        let submitted = ui.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(submitted.as_deref(), Some("abcdef"));
+    }
+
+    #[test]
+    fn prompt_rows_scales_with_length() {
+        let short = prompt_rows("hi");
+        let long = prompt_rows(&"x".repeat(500));
+        assert!(short >= 1);
+        assert!(long >= short);
     }
 }
