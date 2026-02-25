@@ -72,6 +72,9 @@ impl TerminalUi {
                 let submitted = std::mem::take(&mut self.input_buffer);
                 print!("\r\n");
                 let _ = io::stdout().flush();
+                // Keep the submitted line in scrollback and draw a fresh prompt
+                // on the next line without trying to erase wrapped rows above.
+                self.rendered_prompt_rows = 0;
                 self.redraw_prompt();
                 Some(submitted)
             }
