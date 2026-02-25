@@ -6,6 +6,10 @@ pub enum UserCommand {
     KeyRotate,
     KeyRefill,
     KeyRevoke,
+    TrustStatus,
+    TrustVerify,
+    TrustUnverify,
+    TrustList,
     Quit,
     SendMessage(String),
     Ignore,
@@ -40,6 +44,22 @@ pub fn parse_user_command(line: &str) -> UserCommand {
 
     if trimmed == "/keys revoke" {
         return UserCommand::KeyRevoke;
+    }
+
+    if trimmed == "/trust" {
+        return UserCommand::TrustStatus;
+    }
+
+    if trimmed == "/trust verify" {
+        return UserCommand::TrustVerify;
+    }
+
+    if trimmed == "/trust unverify" {
+        return UserCommand::TrustUnverify;
+    }
+
+    if trimmed == "/trust list" {
+        return UserCommand::TrustList;
     }
 
     if trimmed.starts_with("/c") {
@@ -120,5 +140,31 @@ mod tests {
     #[test]
     fn parse_command_key_revoke() {
         assert_eq!(parse_user_command("/keys revoke"), UserCommand::KeyRevoke);
+    }
+
+    #[test]
+    fn parse_command_trust_status() {
+        assert_eq!(parse_user_command("/trust"), UserCommand::TrustStatus);
+    }
+
+    #[test]
+    fn parse_command_trust_verify() {
+        assert_eq!(
+            parse_user_command("/trust verify"),
+            UserCommand::TrustVerify
+        );
+    }
+
+    #[test]
+    fn parse_command_trust_unverify() {
+        assert_eq!(
+            parse_user_command("/trust unverify"),
+            UserCommand::TrustUnverify
+        );
+    }
+
+    #[test]
+    fn parse_command_trust_list() {
+        assert_eq!(parse_user_command("/trust list"), UserCommand::TrustList);
     }
 }

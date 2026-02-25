@@ -3,6 +3,7 @@ use crate::{
     commands::{parse_user_command, UserCommand},
     e2e::SecureMessenger,
     keys::KeyManager,
+    trust::{ActivePeerTrust, SessionTrustState, TrustManager},
     ui::TerminalUi,
     wire::{extract_wire_action, handle_server_text, ClientState, WireAction},
 };
@@ -21,17 +22,29 @@ pub struct ClientRuntime {
     state: ClientState,
     bootstrap: BootstrapState,
     secure_messenger: SecureMessenger,
+    trust: TrustManager,
+    active_peer_trust: Option<ActivePeerTrust>,
     request_counter: u64,
 }
 
 impl ClientRuntime {
-    pub fn new() -> Self {
+    pub fn new(trust: TrustManager) -> Self {
         Self {
             state: ClientState::default(),
             bootstrap: BootstrapState::default(),
             secure_messenger: SecureMessenger::default(),
+            trust,
+            active_peer_trust: None,
             request_counter: 1,
         }
+    }
+
+    pub fn trust_overview_line(&self) -> String {
+        format!(
+            "[trust] verified_contacts={} file={}",
+            self.trust.verified_count(),
+            self.trust.trust_file().display()
+        )
     }
 
     pub async fn initialize_session(
@@ -60,7 +73,7 @@ impl ClientRuntime {
             UserCommand::Ignore => Ok(true),
             UserCommand::Unknown => {
                 ui.print_line(
-                    "Unknown command. Use /new, /c CODE, /keys, /keys rotate, /keys refill, /keys revoke, /q",
+                    "Unknown command. Use /new, /c CODE, /keys, /keys rotate, /keys refill, /keys revoke, /trust, /trust verify, /trust unverify, /trust list, /q",
                 );
                 Ok(true)
             }
@@ -125,6 +138,59 @@ impl ClientRuntime {
                 .await?;
                 Ok(true)
             }
+            UserCommand::TrustStatus => {
+                self.print_trust_status(ui);
+                Ok(true)
+            }
+            UserCommand::TrustVerify => {
+                let Some(active) = self.active_peer_trust.as_ref() else {
+                    ui.print_line(
+                        "[trust] no active secure peer; establish session first, then /trust verify",
+                    );
+                    return Ok(true);
+                };
+
+                self.trust.verify_peer(&active.peer_ik_ed25519)?;
+                let refreshed = self.trust.evaluate_peer(&active.peer_ik_ed25519)?;
+                self.active_peer_trust = Some(refreshed.clone());
+                ui.print_line(&format!(
+                    "[trust] verified peer fp={} safety={}",
+                    refreshed.fingerprint_short, refreshed.safety_number
+                ));
+                Ok(true)
+            }
+            UserCommand::TrustUnverify => {
+                let Some(active) = self.active_peer_trust.as_ref() else {
+                    ui.print_line(
+                        "[trust] no active secure peer; establish session first, then /trust unverify",
+                    );
+                    return Ok(true);
+                };
+
+                self.trust.unverify_peer(&active.peer_ik_ed25519)?;
+                let refreshed = self.trust.evaluate_peer(&active.peer_ik_ed25519)?;
+                self.active_peer_trust = Some(refreshed.clone());
+                ui.print_line(&format!(
+                    "[trust] unverified peer fp={} safety={}",
+                    refreshed.fingerprint_short, refreshed.safety_number
+                ));
+                Ok(true)
+            }
+            UserCommand::TrustList => {
+                let verified = self.trust.list_verified();
+                if verified.is_empty() {
+                    ui.print_line("[trust] verified contacts: none");
+                    return Ok(true);
+                }
+                ui.print_line(&format!("[trust] verified contacts: {}", verified.len()));
+                for entry in verified {
+                    ui.print_line(&format!(
+                        "[trust] fp={} safety={}",
+                        entry.fingerprint_short, entry.safety_number
+                    ));
+                }
+                Ok(true)
+            }
             UserCommand::SendMessage(text) => {
                 if !self.state.active_session {
                     ui.print_line("No active session. Use /new or /c CODE");
@@ -181,6 +247,7 @@ impl ClientRuntime {
                     WireAction::SessionStarted { .. } | WireAction::SessionEnded
                 ) {
                     self.secure_messenger.clear();
+                    self.active_peer_trust = None;
                 }
 
                 handle_wire_action(
@@ -200,6 +267,20 @@ impl ClientRuntime {
                             "[e2e] failed to activate secure messaging: {err}"
                         ));
                         self.state.secure_active = false;
+                    } else {
+                        let trust = self.trust.evaluate_peer(&material.peer_ik_ed25519)?;
+                        self.print_active_trust(ui, &trust);
+                        if trust.state == SessionTrustState::KeyChanged {
+                            let previous = trust
+                                .previous_fingerprint_short
+                                .as_deref()
+                                .unwrap_or("unknown");
+                            ui.print_error(&format!(
+                                "[trust] WARNING: peer identity key changed (prev_fp={previous} new_fp={}); re-verify with /trust verify",
+                                trust.fingerprint_short
+                            ));
+                        }
+                        self.active_peer_trust = Some(trust);
                     }
                 }
             }
@@ -233,6 +314,7 @@ impl ClientRuntime {
         )
         .await?;
         self.secure_messenger.clear();
+        self.active_peer_trust = None;
         Ok(())
     }
 
@@ -275,5 +357,25 @@ impl ClientRuntime {
         let raw = serde_json::to_string(&envelope)?;
         ws_writer.send(Message::Text(raw.into())).await?;
         Ok(())
+    }
+
+    fn print_trust_status(&self, ui: &mut TerminalUi) {
+        if let Some(active) = self.active_peer_trust.as_ref() {
+            self.print_active_trust(ui, active);
+        } else {
+            ui.print_line(&format!(
+                "[trust] no active secure peer; verified_contacts={}",
+                self.trust.verified_count()
+            ));
+        }
+    }
+
+    fn print_active_trust(&self, ui: &mut TerminalUi, active: &ActivePeerTrust) {
+        ui.print_line(&format!(
+            "[trust] state={} fp={} safety={}",
+            active.state.as_str(),
+            active.fingerprint_short,
+            active.safety_number
+        ));
     }
 }

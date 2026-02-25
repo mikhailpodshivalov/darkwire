@@ -4,6 +4,7 @@ mod config;
 mod e2e;
 mod keys;
 mod runtime;
+mod trust;
 mod ui;
 mod wire;
 
@@ -23,6 +24,7 @@ use tokio::{
     time::{self, Duration, MissedTickBehavior},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use trust::{default_trust_file_path, TrustManager};
 use ui::{RawModeGuard, TerminalUi};
 
 pub(crate) use runtime::WsWriter;
@@ -45,7 +47,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     ui.print_line(&format!("Connecting to {relay_ws} ..."));
     let (ws_stream, _) = connect_async(relay_ws.as_str()).await?;
-    ui.print_line("Connected. Commands: /new, /c CODE, /keys, /keys rotate, /keys refill, /keys revoke, /q (/i alias)");
+    ui.print_line("Connected. Commands: /new, /c CODE, /keys, /keys rotate, /keys refill, /keys revoke, /trust, /trust verify, /trust unverify, /trust list, /q (/i alias)");
     ui.print_line(&format!(
         "[keys] {} file={}",
         keys.status_line(),
@@ -58,7 +60,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut handshake_tick = time::interval(Duration::from_secs(1));
     handshake_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    let mut runtime = ClientRuntime::new();
+    let trust_file = default_trust_file_path(keys.key_file());
+    let trust = TrustManager::load_or_init(trust_file)?;
+    let mut runtime = ClientRuntime::new(trust);
+    ui.print_line(&runtime.trust_overview_line());
     runtime
         .initialize_session(&mut ws_writer, &keys, &invite_relay, invite_ttl)
         .await?;
