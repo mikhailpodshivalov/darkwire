@@ -238,6 +238,7 @@ impl AppState {
             used: false,
             expires_at: now + Duration::from_secs(u64::from(payload.e)),
         };
+        self.invites.invalidate_for_creator(creator_conn).await;
         self.invites.insert(record).await;
 
         Ok(InviteCreated {
@@ -579,6 +580,64 @@ mod tests {
             .await
             .expect_err("expired invite should fail");
         assert_eq!(err, InviteUseError::InviteExpired);
+    }
+
+    #[tokio::test]
+    async fn create_invite_invalidates_previous_invites_for_creator() {
+        let state = AppState::new(LimitsConfig::default());
+        let (tx_a, _rx_a) = channel();
+        let (tx_b, _rx_b) = channel();
+        let inviter = state.register_connection(test_ip(12), tx_a).await;
+        let joiner = state.register_connection(test_ip(13), tx_b).await;
+
+        let first = state
+            .create_invite(
+                inviter,
+                test_ip(12),
+                InviteCreateRequest {
+                    r: vec!["ws://127.0.0.1:7000".to_string()],
+                    e: 600,
+                    o: true,
+                },
+            )
+            .await
+            .expect("first invite should pass");
+
+        let second = state
+            .create_invite(
+                inviter,
+                test_ip(12),
+                InviteCreateRequest {
+                    r: vec!["ws://127.0.0.1:7000".to_string()],
+                    e: 600,
+                    o: true,
+                },
+            )
+            .await
+            .expect("second invite should pass");
+
+        let first_err = state
+            .use_invite(
+                joiner,
+                test_ip(13),
+                InviteUseRequest {
+                    invite: first.invite,
+                },
+            )
+            .await
+            .expect_err("old invite should be invalidated");
+        assert_eq!(first_err, InviteUseError::InvalidInvite);
+
+        state
+            .use_invite(
+                joiner,
+                test_ip(13),
+                InviteUseRequest {
+                    invite: second.invite,
+                },
+            )
+            .await
+            .expect("new invite should remain valid");
     }
 
     #[tokio::test]

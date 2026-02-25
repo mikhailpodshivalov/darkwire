@@ -51,6 +51,15 @@ impl InviteStore {
         invites.insert(record.token.clone(), record);
     }
 
+    pub async fn invalidate_for_creator(&self, creator_conn: Uuid) -> usize {
+        let now = Instant::now();
+        let mut invites = self.invites.write().await;
+        prune_expired_locked(&mut invites, now);
+        let before = invites.len();
+        invites.retain(|_, record| record.creator_conn != creator_conn);
+        before.saturating_sub(invites.len())
+    }
+
     pub async fn consume(
         &self,
         payload: &InvitePayloadV1,
@@ -198,5 +207,31 @@ mod tests {
             .await
             .expect_err("mismatched payload should fail");
         assert_eq!(err, InviteConsumeError::PayloadMismatch);
+    }
+
+    #[tokio::test]
+    async fn invalidate_for_creator_removes_only_matching_invites() {
+        let store = InviteStore::new();
+        let now = Instant::now();
+        let creator_a = Uuid::new_v4();
+        let creator_b = Uuid::new_v4();
+
+        let mut invite_a1 = record("DEFGHJKLMNPQRSTU", now);
+        invite_a1.creator_conn = creator_a;
+        let mut invite_a2 = record("EFGHJKLMNPQRSTUV", now);
+        invite_a2.creator_conn = creator_a;
+        let mut invite_b1 = record("FGHJKLMNPQRSTUVW", now);
+        invite_b1.creator_conn = creator_b;
+
+        store.insert(invite_a1).await;
+        store.insert(invite_a2).await;
+        store.insert(invite_b1).await;
+
+        let removed = store.invalidate_for_creator(creator_a).await;
+        assert_eq!(removed, 2);
+        assert_eq!(store.invite_count().await, 1);
+        assert!(!store.contains_token("DEFGHJKLMNPQRSTU").await);
+        assert!(!store.contains_token("EFGHJKLMNPQRSTUV").await);
+        assert!(store.contains_token("FGHJKLMNPQRSTUVW").await);
     }
 }
