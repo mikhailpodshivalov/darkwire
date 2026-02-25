@@ -101,11 +101,8 @@ cargo run -p darkwire-relay --bin darkwire-relay -- --listen 127.0.0.1:7000
 cargo run -p darkwire-client --bin darkwire -- --relay ws://127.0.0.1:7000/ws
 ```
 
-In client A:
-```text
-/i
-```
-Copy generated invite string.
+Client A auto-creates invite on startup.
+Copy generated invite string from `[invite:...]`.
 
 ### 3. Run joiner client (terminal B)
 ```bash
@@ -120,7 +117,8 @@ In client B:
 After `session.started` on both sides, type text lines to chat.
 
 ## Client commands
-- `/i` create invite
+- `/new` create/rotate invite (invalidates previous invite for this client)
+- `/i` legacy alias for `/new`
 - `/c CODE` connect by invite
 - `/q` quit (sends `session.leave` when session is active)
 - any other non-empty line sends chat message to active session
@@ -137,11 +135,12 @@ After `session.started` on both sides, type text lines to chat.
 
 ## Demo scenario (manual)
 1. Start relay.
-2. Start client A and run `/i`.
+2. Start client A and copy startup invite code.
 3. Start client B and run `/c <invite>`.
 4. Exchange messages both ways.
 5. Close client B (`/q` or Ctrl+C): client A receives `session.ended` with `peer_disconnect`.
-6. To reconnect, use `/c` again with a fresh invite.
+6. To rotate compromised invite, run `/new` in client A and share new code.
+7. To reconnect, use `/c` again with a fresh invite.
 
 ## Smoke test
 Run end-to-end smoke checks:

@@ -67,13 +67,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Connecting to {relay_ws} ...");
     let (ws_stream, _) = connect_async(relay_ws.as_str()).await?;
-    println!("Connected. Commands: /i, /c CODE, /q");
+    println!("Connected. Commands: /new, /c CODE, /q (/i alias)");
 
     let (mut ws_writer, mut ws_reader) = ws_stream.split();
     let mut stdin_lines = BufReader::new(tokio::io::stdin()).lines();
 
     let mut state = ClientState::default();
     let mut request_counter = 1_u64;
+    request_invite(
+        &mut ws_writer,
+        &invite_relay,
+        invite_ttl,
+        &mut request_counter,
+    )
+    .await?;
 
     loop {
         tokio::select! {
@@ -145,7 +152,7 @@ async fn handle_user_input(
     match parse_user_command(line) {
         UserCommand::Ignore => Ok(true),
         UserCommand::Unknown => {
-            println!("Unknown command. Use /i, /c CODE, /q");
+            println!("Unknown command. Use /new, /c CODE, /q");
             Ok(true)
         }
         UserCommand::Quit => {
@@ -162,19 +169,7 @@ async fn handle_user_input(
             Ok(false)
         }
         UserCommand::CreateInvite => {
-            let payload = InviteCreateRequest {
-                r: vec![invite_relay.to_string()],
-                e: invite_ttl,
-                o: true,
-            };
-
-            send_request(
-                ws_writer,
-                events::names::INVITE_CREATE,
-                payload,
-                request_counter,
-            )
-            .await?;
+            request_invite(ws_writer, invite_relay, invite_ttl, request_counter).await?;
             Ok(true)
         }
         UserCommand::ConnectInvite(invite) => {
@@ -190,7 +185,7 @@ async fn handle_user_input(
         }
         UserCommand::SendMessage(text) => {
             if !state.active_session {
-                println!("No active session. Use /i or /c CODE");
+                println!("No active session. Use /new or /c CODE");
                 return Ok(true);
             }
 
@@ -199,6 +194,27 @@ async fn handle_user_input(
             Ok(true)
         }
     }
+}
+
+async fn request_invite(
+    ws_writer: &mut WsWriter,
+    invite_relay: &str,
+    invite_ttl: u32,
+    request_counter: &mut u64,
+) -> Result<(), Box<dyn Error>> {
+    let payload = InviteCreateRequest {
+        r: vec![invite_relay.to_string()],
+        e: invite_ttl,
+        o: true,
+    };
+
+    send_request(
+        ws_writer,
+        events::names::INVITE_CREATE,
+        payload,
+        request_counter,
+    )
+    .await
 }
 
 async fn send_request<T: Serialize>(
@@ -293,7 +309,7 @@ fn parse_user_command(line: &str) -> UserCommand {
         return UserCommand::Ignore;
     }
 
-    if trimmed == "/i" {
+    if trimmed == "/new" || trimmed == "/i" {
         return UserCommand::CreateInvite;
     }
 
@@ -349,6 +365,11 @@ mod tests {
 
     #[test]
     fn parse_command_invite_create() {
+        assert_eq!(parse_user_command("/new"), UserCommand::CreateInvite);
+    }
+
+    #[test]
+    fn parse_command_invite_create_legacy_alias() {
         assert_eq!(parse_user_command("/i"), UserCommand::CreateInvite);
     }
 
