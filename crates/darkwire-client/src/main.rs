@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     ui.print_line(&format!("Connecting to {relay_ws} ..."));
     let (ws_stream, _) = connect_async(relay_ws.as_str()).await?;
-    ui.print_line("Connected. Use /help for commands.");
+    ui.print_line("Connected. Use /help for basic commands.");
     ui.print_line(&format!(
         "[keys] {} file={}",
         keys.status_line(),

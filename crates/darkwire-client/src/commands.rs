@@ -1,6 +1,7 @@
 #[derive(Debug, PartialEq, Eq)]
 pub enum UserCommand {
     Help,
+    HelpAll,
     CreateInvite,
     ConnectInvite(String),
     KeyStatus,
@@ -23,8 +24,20 @@ pub fn parse_user_command(line: &str) -> UserCommand {
         return UserCommand::Ignore;
     }
 
-    if trimmed == "/help" {
-        return UserCommand::Help;
+    if trimmed.starts_with("/help") {
+        let mut parts = trimmed.split_whitespace();
+        let command = parts.next();
+        let arg = parts.next();
+        let extra = parts.next();
+
+        if command == Some("/help") && extra.is_none() {
+            if arg.is_none() {
+                return UserCommand::Help;
+            }
+            if arg == Some("all") {
+                return UserCommand::HelpAll;
+            }
+        }
     }
 
     if trimmed == "/new" || trimmed == "/i" {
@@ -87,9 +100,21 @@ pub fn parse_user_command(line: &str) -> UserCommand {
     UserCommand::SendMessage(line.to_string())
 }
 
-pub fn command_help_lines() -> &'static [&'static str] {
+pub fn command_help_basic_lines() -> &'static [&'static str] {
     &[
-        "/help - show this help",
+        "/help - show basic help",
+        "/help all - show full command list",
+        "/new (/i) - create new invite",
+        "/c CODE - connect by invite code",
+        "/q - quit",
+        "<text> - send encrypted message in active secure session",
+    ]
+}
+
+pub fn command_help_all_lines() -> &'static [&'static str] {
+    &[
+        "/help - show basic help",
+        "/help all - show full command list",
         "/new (/i) - create new invite",
         "/c CODE - connect by invite code",
         "/keys - show local key status",
@@ -117,6 +142,11 @@ mod tests {
     #[test]
     fn parse_command_help() {
         assert_eq!(parse_user_command("/help"), UserCommand::Help);
+    }
+
+    #[test]
+    fn parse_command_help_all() {
+        assert_eq!(parse_user_command("/help all"), UserCommand::HelpAll);
     }
 
     #[test]
@@ -197,9 +227,16 @@ mod tests {
     }
 
     #[test]
-    fn help_lines_include_trust_commands() {
-        let help = command_help_lines().join("\n");
+    fn basic_help_lines_hide_advanced_commands() {
+        let help = command_help_basic_lines().join("\n");
+        assert!(!help.contains("/keys rotate"));
+        assert!(!help.contains("/trust verify"));
+    }
+
+    #[test]
+    fn all_help_lines_include_advanced_commands() {
+        let help = command_help_all_lines().join("\n");
+        assert!(help.contains("/keys rotate"));
         assert!(help.contains("/trust verify"));
-        assert!(help.contains("/trust unverify"));
     }
 }
