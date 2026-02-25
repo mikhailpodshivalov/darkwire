@@ -104,5 +104,8 @@ fn rate_limit_scope_name(scope: darkwire_protocol::events::RateLimitScope) -> &'
         darkwire_protocol::events::RateLimitScope::InviteCreate => "invite_create",
         darkwire_protocol::events::RateLimitScope::InviteUse => "invite_use",
         darkwire_protocol::events::RateLimitScope::MsgSend => "msg_send",
+        darkwire_protocol::events::RateLimitScope::PrekeyPublish => "prekey_publish",
+        darkwire_protocol::events::RateLimitScope::PrekeyGet => "prekey_get",
+        darkwire_protocol::events::RateLimitScope::Handshake => "handshake",
     }
 }

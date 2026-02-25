@@ -16,6 +16,8 @@ struct IpRateState {
     create_min: VecDeque<Instant>,
     create_hour: VecDeque<Instant>,
     use_min: VecDeque<Instant>,
+    prekey_publish_min: VecDeque<Instant>,
+    prekey_get_min: VecDeque<Instant>,
     failed_invite_uses: u32,
     backoff_until: Option<Instant>,
 }
@@ -52,6 +54,23 @@ impl RateLimitStore {
     pub async fn record_invite_use_result(&self, ip: IpAddr, success: bool, limits: &LimitsConfig) {
         self.record_invite_use_result_at(ip, success, limits, Instant::now())
             .await;
+    }
+
+    pub async fn check_prekey_publish(
+        &self,
+        ip: IpAddr,
+        limits: &LimitsConfig,
+    ) -> Result<(), RateLimitHit> {
+        self.check_prekey_publish_at(ip, limits, Instant::now())
+            .await
+    }
+
+    pub async fn check_prekey_get(
+        &self,
+        ip: IpAddr,
+        limits: &LimitsConfig,
+    ) -> Result<(), RateLimitHit> {
+        self.check_prekey_get_at(ip, limits, Instant::now()).await
     }
 
     async fn check_invite_create_at(
@@ -145,6 +164,52 @@ impl RateLimitStore {
             let backoff_secs = (u64::from(step) * 5).min(60);
             state.backoff_until = Some(now + Duration::from_secs(backoff_secs));
         }
+    }
+
+    async fn check_prekey_publish_at(
+        &self,
+        ip: IpAddr,
+        limits: &LimitsConfig,
+        now: Instant,
+    ) -> Result<(), RateLimitHit> {
+        let mut by_ip = self.by_ip.lock().await;
+        let state = by_ip.entry(ip).or_default();
+
+        prune_window(&mut state.prekey_publish_min, Duration::from_secs(60), now);
+        if let Some(retry_after) = retry_after_window(
+            &state.prekey_publish_min,
+            limits.prekey_publish_per_min,
+            Duration::from_secs(60),
+            now,
+        ) {
+            return Err(RateLimitHit { retry_after });
+        }
+
+        state.prekey_publish_min.push_back(now);
+        Ok(())
+    }
+
+    async fn check_prekey_get_at(
+        &self,
+        ip: IpAddr,
+        limits: &LimitsConfig,
+        now: Instant,
+    ) -> Result<(), RateLimitHit> {
+        let mut by_ip = self.by_ip.lock().await;
+        let state = by_ip.entry(ip).or_default();
+
+        prune_window(&mut state.prekey_get_min, Duration::from_secs(60), now);
+        if let Some(retry_after) = retry_after_window(
+            &state.prekey_get_min,
+            limits.prekey_get_per_min,
+            Duration::from_secs(60),
+            now,
+        ) {
+            return Err(RateLimitHit { retry_after });
+        }
+
+        state.prekey_get_min.push_back(now);
+        Ok(())
     }
 }
 
@@ -287,5 +352,49 @@ mod tests {
             .check_invite_use_at(ip(), &limits, next_attempt)
             .await
             .expect("counter should reset after success");
+    }
+
+    #[tokio::test]
+    async fn prekey_publish_respects_per_minute_limit() {
+        let mut limits = LimitsConfig::default();
+        limits.prekey_publish_per_min = 2;
+
+        let store = RateLimitStore::new();
+        let now = Instant::now();
+
+        store
+            .check_prekey_publish_at(ip(), &limits, now)
+            .await
+            .expect("first publish should pass");
+        store
+            .check_prekey_publish_at(ip(), &limits, now + Duration::from_secs(1))
+            .await
+            .expect("second publish should pass");
+
+        let err = store
+            .check_prekey_publish_at(ip(), &limits, now + Duration::from_secs(2))
+            .await
+            .expect_err("third publish should be rate limited");
+        assert!(err.retry_after >= Duration::from_secs(57));
+    }
+
+    #[tokio::test]
+    async fn prekey_get_respects_per_minute_limit() {
+        let mut limits = LimitsConfig::default();
+        limits.prekey_get_per_min = 1;
+
+        let store = RateLimitStore::new();
+        let now = Instant::now();
+
+        store
+            .check_prekey_get_at(ip(), &limits, now)
+            .await
+            .expect("first get should pass");
+
+        let err = store
+            .check_prekey_get_at(ip(), &limits, now + Duration::from_secs(1))
+            .await
+            .expect_err("second get should be rate limited");
+        assert!(err.retry_after >= Duration::from_secs(58));
     }
 }

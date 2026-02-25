@@ -1,5 +1,5 @@
 use crate::app_state::ConnId;
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub fn log_inbound_event(
     conn_id: ConnId,
@@ -21,6 +21,15 @@ pub fn log_invalid_json(conn_id: ConnId, payload_bytes: usize) {
         %conn_id,
         payload_bytes,
         "connection.event_invalid_json"
+    );
+}
+
+pub fn log_handshake_failure(conn_id: ConnId, event_type: &str, reason: &str) {
+    warn!(
+        %conn_id,
+        event_type,
+        reason,
+        "connection.handshake_failure"
     );
 }
 
@@ -92,6 +101,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             log_inbound_event(Uuid::new_v4(), "invite.use", Some("req-1"), 321);
             log_invalid_json(Uuid::new_v4(), 144);
+            log_handshake_failure(Uuid::new_v4(), "e2e.prekey.get", "prekey_not_found");
 
             // These values should never be present in log output.
             let _ = invite_code;
@@ -103,6 +113,8 @@ mod tests {
         assert!(output.contains("connection.event_received"));
         assert!(output.contains("invite.use"));
         assert!(output.contains("req-1"));
+        assert!(output.contains("connection.handshake_failure"));
+        assert!(output.contains("prekey_not_found"));
         assert!(!output.contains(invite_code));
         assert!(!output.contains(secret_text));
     }

@@ -9,6 +9,8 @@ pub struct LimitsConfig {
     pub invite_use_backoff_after_failures: u32,
     pub msg_per_sec: u32,
     pub max_msg_bytes: usize,
+    pub prekey_publish_per_min: u32,
+    pub prekey_get_per_min: u32,
     pub idle_timeout_secs: u64,
 }
 
@@ -21,6 +23,8 @@ impl Default for LimitsConfig {
             invite_use_backoff_after_failures: 5,
             msg_per_sec: 1,
             max_msg_bytes: 8 * 1024,
+            prekey_publish_per_min: 10,
+            prekey_get_per_min: 60,
             idle_timeout_secs: 15 * 60,
         }
     }
@@ -45,6 +49,8 @@ mod tests {
         assert_eq!(cfg.invite_use_backoff_after_failures, 5);
         assert_eq!(cfg.msg_per_sec, 1);
         assert_eq!(cfg.max_msg_bytes, 8192);
+        assert_eq!(cfg.prekey_publish_per_min, 10);
+        assert_eq!(cfg.prekey_get_per_min, 60);
         assert_eq!(cfg.idle_timeout(), Duration::from_secs(900));
     }
 }
