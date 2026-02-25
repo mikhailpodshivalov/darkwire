@@ -6,6 +6,9 @@ Darkwire is an MVP terminal chat in "walkie-talkie" mode:
 - if peer is offline, delivery is dropped
 - relay logs metadata only (no plaintext/ciphertext, no invite codes)
 
+## Security docs
+- Phase 2 security baseline (frozen): `docs/phase2_security_spec_freeze.md`
+
 ## MVP status
 Implemented phases 1-7:
 - workspace + protocol
