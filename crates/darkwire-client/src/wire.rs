@@ -1,12 +1,25 @@
 use darkwire_protocol::events::{
-    self, ErrorEvent, InviteCreatedEvent, MsgRecvEvent, PrekeyBundleEvent, PrekeyPublishedEvent,
-    RateLimitedEvent, ReadyEvent, SessionEndReason, SessionEndedEvent, SessionStartedEvent,
+    self, ErrorEvent, HandshakeAcceptRequest, HandshakeInitRequest, InviteCreatedEvent,
+    MsgRecvEvent, PrekeyBundleEvent, PrekeyPublishedEvent, RateLimitedEvent, ReadyEvent,
+    SessionEndReason, SessionEndedEvent, SessionStartedEvent,
 };
 use serde::Deserialize;
+use uuid::Uuid;
 
 #[derive(Debug, Default)]
 pub struct ClientState {
     pub active_session: bool,
+    pub active_session_id: Option<Uuid>,
+    pub secure_active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum WireAction {
+    SessionStarted { session_id: Uuid },
+    SessionEnded,
+    PrekeyBundle(PrekeyBundleEvent),
+    HandshakeInitRecv(HandshakeInitRequest),
+    HandshakeAcceptRecv(HandshakeAcceptRequest),
 }
 
 #[derive(Debug, Deserialize)]
@@ -17,6 +30,36 @@ struct IncomingEnvelope {
     request_id: Option<String>,
     #[serde(rename = "d", default)]
     data: serde_json::Value,
+}
+
+pub fn extract_wire_action(raw: &str) -> Option<WireAction> {
+    let envelope: IncomingEnvelope = serde_json::from_str(raw).ok()?;
+    match envelope.event_type.as_str() {
+        events::names::SESSION_STARTED => {
+            serde_json::from_value::<SessionStartedEvent>(envelope.data)
+                .ok()
+                .map(|event| WireAction::SessionStarted {
+                    session_id: event.session_id,
+                })
+        }
+        events::names::SESSION_ENDED => Some(WireAction::SessionEnded),
+        events::names::E2E_PREKEY_BUNDLE => {
+            serde_json::from_value::<PrekeyBundleEvent>(envelope.data)
+                .ok()
+                .map(WireAction::PrekeyBundle)
+        }
+        events::names::E2E_HANDSHAKE_INIT_RECV => {
+            serde_json::from_value::<HandshakeInitRequest>(envelope.data)
+                .ok()
+                .map(WireAction::HandshakeInitRecv)
+        }
+        events::names::E2E_HANDSHAKE_ACCEPT_RECV => {
+            serde_json::from_value::<HandshakeAcceptRequest>(envelope.data)
+                .ok()
+                .map(WireAction::HandshakeAcceptRecv)
+        }
+        _ => None,
+    }
 }
 
 pub fn handle_server_text(raw: &str, state: &mut ClientState) -> Option<String> {
@@ -46,6 +89,8 @@ pub fn handle_server_text(raw: &str, state: &mut ClientState) -> Option<String> 
         events::names::SESSION_STARTED => {
             if let Ok(event) = serde_json::from_value::<SessionStartedEvent>(envelope.data) {
                 state.active_session = true;
+                state.active_session_id = Some(event.session_id);
+                state.secure_active = false;
                 return Some(format!("[session:{rid}] started id={}", event.session_id));
             }
         }
@@ -70,6 +115,22 @@ pub fn handle_server_text(raw: &str, state: &mut ClientState) -> Option<String> 
                 ));
             }
         }
+        events::names::E2E_HANDSHAKE_INIT_RECV => {
+            if let Ok(event) = serde_json::from_value::<HandshakeInitRequest>(envelope.data) {
+                return Some(format!(
+                    "[e2e:{rid}] handshake.init.recv session_id={} hs_id={}",
+                    event.session_id, event.hs_id
+                ));
+            }
+        }
+        events::names::E2E_HANDSHAKE_ACCEPT_RECV => {
+            if let Ok(event) = serde_json::from_value::<HandshakeAcceptRequest>(envelope.data) {
+                return Some(format!(
+                    "[e2e:{rid}] handshake.accept.recv session_id={} hs_id={}",
+                    event.session_id, event.hs_id
+                ));
+            }
+        }
         events::names::MSG_RECV => {
             if let Ok(event) = serde_json::from_value::<MsgRecvEvent>(envelope.data) {
                 return Some(format!("peer> {}", event.text));
@@ -78,6 +139,8 @@ pub fn handle_server_text(raw: &str, state: &mut ClientState) -> Option<String> 
         events::names::SESSION_ENDED => {
             if let Ok(event) = serde_json::from_value::<SessionEndedEvent>(envelope.data) {
                 state.active_session = false;
+                state.active_session_id = None;
+                state.secure_active = false;
                 return Some(format!(
                     "[session:{rid}] ended reason={}",
                     session_end_reason_name(event.reason)

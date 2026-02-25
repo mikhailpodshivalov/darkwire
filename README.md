@@ -119,6 +119,8 @@ In client B:
 ```
 
 After `session.started` on both sides, type text lines to chat.
+Client now auto-runs session bootstrap (`prekey.get` -> `handshake.init/accept`) after pairing.
+Wait for `[e2e] secure session established ...` before sending messages.
 
 ## Client commands
 - `/new` create/rotate invite (invalidates previous invite for this client)
@@ -129,7 +131,7 @@ After `session.started` on both sides, type text lines to chat.
 - `/keys refill` refill OPK pool to target and publish new bundle
 - `/keys revoke` revoke local identity (regenerate identity + prekeys) and publish new bundle
 - `/q` quit (sends `session.leave` when session is active)
-- any other non-empty line sends chat message to active session
+- any other non-empty line sends chat message to active secure session
 
 ## Configuration
 ### Relay (`darkwire-relay`)
@@ -178,6 +180,7 @@ The script runs workspace checks and key relay integration tests.
 - `invite.create`: `5/min/IP` + `20/hour/IP`
 - `invite.use`: `20/min/IP`, backoff after 5 failed attempts
 - messages: `~1/sec/connection`, max size `8KB`
+- handshake control events: `30/min/IP`
 - idle timeout: `15 min`
 - logs are metadata-only; payload content and secrets are not logged.
 

@@ -11,6 +11,7 @@ pub struct LimitsConfig {
     pub max_msg_bytes: usize,
     pub prekey_publish_per_min: u32,
     pub prekey_get_per_min: u32,
+    pub handshake_per_min: u32,
     pub idle_timeout_secs: u64,
 }
 
@@ -25,6 +26,7 @@ impl Default for LimitsConfig {
             max_msg_bytes: 8 * 1024,
             prekey_publish_per_min: 10,
             prekey_get_per_min: 60,
+            handshake_per_min: 30,
             idle_timeout_secs: 15 * 60,
         }
     }
@@ -51,6 +53,7 @@ mod tests {
         assert_eq!(cfg.max_msg_bytes, 8192);
         assert_eq!(cfg.prekey_publish_per_min, 10);
         assert_eq!(cfg.prekey_get_per_min, 60);
+        assert_eq!(cfg.handshake_per_min, 30);
         assert_eq!(cfg.idle_timeout(), Duration::from_secs(900));
     }
 }
