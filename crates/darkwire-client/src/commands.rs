@@ -1,5 +1,6 @@
 #[derive(Debug, PartialEq, Eq)]
 pub enum UserCommand {
+    Help,
     CreateInvite,
     ConnectInvite(String),
     KeyStatus,
@@ -20,6 +21,10 @@ pub fn parse_user_command(line: &str) -> UserCommand {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return UserCommand::Ignore;
+    }
+
+    if trimmed == "/help" {
+        return UserCommand::Help;
     }
 
     if trimmed == "/new" || trimmed == "/i" {
@@ -82,6 +87,24 @@ pub fn parse_user_command(line: &str) -> UserCommand {
     UserCommand::SendMessage(line.to_string())
 }
 
+pub fn command_help_lines() -> &'static [&'static str] {
+    &[
+        "/help - show this help",
+        "/new (/i) - create new invite",
+        "/c CODE - connect by invite code",
+        "/keys - show local key status",
+        "/keys rotate - rotate signed prekey",
+        "/keys refill - refill one-time prekeys",
+        "/keys revoke - regenerate identity + prekeys",
+        "/trust - show active peer trust status",
+        "/trust verify - mark active peer as verified",
+        "/trust unverify - remove verification for active peer",
+        "/trust list - list verified peers",
+        "/q - quit",
+        "<text> - send encrypted message in active secure session",
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +112,11 @@ mod tests {
     #[test]
     fn parse_command_invite_create() {
         assert_eq!(parse_user_command("/new"), UserCommand::CreateInvite);
+    }
+
+    #[test]
+    fn parse_command_help() {
+        assert_eq!(parse_user_command("/help"), UserCommand::Help);
     }
 
     #[test]
@@ -166,5 +194,12 @@ mod tests {
     #[test]
     fn parse_command_trust_list() {
         assert_eq!(parse_user_command("/trust list"), UserCommand::TrustList);
+    }
+
+    #[test]
+    fn help_lines_include_trust_commands() {
+        let help = command_help_lines().join("\n");
+        assert!(help.contains("/trust verify"));
+        assert!(help.contains("/trust unverify"));
     }
 }

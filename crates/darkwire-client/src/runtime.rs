@@ -1,6 +1,6 @@
 use crate::{
     bootstrap::{abort_handshake_session, handle_wire_action, now_unix, BootstrapState},
-    commands::{parse_user_command, UserCommand},
+    commands::{command_help_lines, parse_user_command, UserCommand},
     e2e::SecureMessenger,
     keys::KeyManager,
     trust::{ActivePeerTrust, SessionTrustState, TrustManager},
@@ -71,10 +71,15 @@ impl ClientRuntime {
     ) -> Result<bool, Box<dyn Error>> {
         match parse_user_command(line) {
             UserCommand::Ignore => Ok(true),
+            UserCommand::Help => {
+                ui.print_line("Commands:");
+                for line in command_help_lines() {
+                    ui.print_line(line);
+                }
+                Ok(true)
+            }
             UserCommand::Unknown => {
-                ui.print_line(
-                    "Unknown command. Use /new, /c CODE, /keys, /keys rotate, /keys refill, /keys revoke, /trust, /trust verify, /trust unverify, /trust list, /q",
-                );
+                ui.print_line("Unknown command. Use /help");
                 Ok(true)
             }
             UserCommand::KeyStatus => {
