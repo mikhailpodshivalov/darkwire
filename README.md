@@ -12,9 +12,17 @@ What you get:
 
 ### Option A: Just chat on existing relay (no Rust needed)
 1. Download a client binary from GitHub Releases.
-2. Run it:
+   For macOS (`darkwire-macos-arm64`), first allow local execution:
 ```bash
-./darkwire
+chmod +x darkwire-macos-arm64
+xattr -dr com.apple.quarantine darkwire-macos-arm64
+```
+2. Run the file you downloaded:
+```bash
+./darkwire-linux-x64
+# or: ./darkwire-linux-arm64
+# or: ./darkwire-macos-arm64
+# or (Windows): .\darkwire-windows-x64.exe
 ```
 3. Set your username:
 ```text
