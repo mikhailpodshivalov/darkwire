@@ -4,6 +4,7 @@ use crate::app_state::{
 };
 use crate::logging;
 use axum::extract::ws::WebSocket;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use darkwire_protocol::events::{
     self, E2eMsgSendRequest, ErrorCode, HandshakeAcceptRequest, HandshakeInitRequest,
     PrekeyGetRequest, PrekeyPublishRequest, RateLimitScope, SessionEndReason,
@@ -567,10 +568,35 @@ fn is_valid_e2e_message_payload(request: &E2eMsgSendRequest) -> bool {
     {
         return false;
     }
+
+    if !is_b64u_with_len(&request.dh_x25519, 32) {
+        return false;
+    }
+    if !is_b64u_with_len(&request.nonce, 12) {
+        return false;
+    }
+    if !is_non_empty_b64u(&request.ct) {
+        return false;
+    }
+
     request.ad.pv == 2
         && request.ad.session_id == request.session_id
         && request.ad.n == request.n
         && request.ad.pn == request.pn
+}
+
+fn is_b64u_with_len(value: &str, expected_len: usize) -> bool {
+    match URL_SAFE_NO_PAD.decode(value.as_bytes()) {
+        Ok(bytes) => bytes.len() == expected_len,
+        Err(_) => false,
+    }
+}
+
+fn is_non_empty_b64u(value: &str) -> bool {
+    match URL_SAFE_NO_PAD.decode(value.as_bytes()) {
+        Ok(bytes) => !bytes.is_empty(),
+        Err(_) => false,
+    }
 }
 
 async fn record_handshake_failure(
@@ -581,4 +607,55 @@ async fn record_handshake_failure(
 ) {
     state.record_handshake_failure(reason).await;
     logging::log_handshake_failure(conn_id, event_type, reason.as_str());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use darkwire_protocol::events::E2eMsgAd;
+    use uuid::Uuid;
+
+    fn sample_payload() -> E2eMsgSendRequest {
+        let session_id = Uuid::new_v4();
+        E2eMsgSendRequest {
+            session_id,
+            n: 1,
+            pn: 0,
+            dh_x25519: URL_SAFE_NO_PAD.encode([1_u8; 32]),
+            nonce: URL_SAFE_NO_PAD.encode([2_u8; 12]),
+            ct: URL_SAFE_NO_PAD.encode([3_u8; 24]),
+            ad: E2eMsgAd {
+                pv: 2,
+                session_id,
+                n: 1,
+                pn: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn e2e_payload_validation_accepts_expected_shape() {
+        assert!(is_valid_e2e_message_payload(&sample_payload()));
+    }
+
+    #[test]
+    fn e2e_payload_validation_rejects_bad_nonce_length() {
+        let mut payload = sample_payload();
+        payload.nonce = URL_SAFE_NO_PAD.encode([0_u8; 8]);
+        assert!(!is_valid_e2e_message_payload(&payload));
+    }
+
+    #[test]
+    fn e2e_payload_validation_rejects_bad_dh_length() {
+        let mut payload = sample_payload();
+        payload.dh_x25519 = URL_SAFE_NO_PAD.encode([0_u8; 31]);
+        assert!(!is_valid_e2e_message_payload(&payload));
+    }
+
+    #[test]
+    fn e2e_payload_validation_rejects_non_base64_ciphertext() {
+        let mut payload = sample_payload();
+        payload.ct = "!not-base64".to_string();
+        assert!(!is_valid_e2e_message_payload(&payload));
+    }
 }

@@ -33,8 +33,15 @@ pub mod names {
     pub const PONG: &str = "pong";
 }
 
+const fn default_protocol_version() -> u8 {
+    2
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Envelope<T> {
+    #[serde(rename = "pv", default = "default_protocol_version")]
+    pub protocol_version: u8,
     #[serde(rename = "t")]
     pub event_type: String,
     #[serde(rename = "rid", skip_serializing_if = "Option::is_none")]
@@ -46,6 +53,7 @@ pub struct Envelope<T> {
 impl<T> Envelope<T> {
     pub fn new(event_type: impl Into<String>, data: T) -> Self {
         Self {
+            protocol_version: default_protocol_version(),
             event_type: event_type.into(),
             request_id: None,
             data,
@@ -59,6 +67,7 @@ impl<T> Envelope<T> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct InviteCreateRequest {
     pub r: Vec<String>,
     pub e: u32,
@@ -68,11 +77,13 @@ pub struct InviteCreateRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct InviteUseRequest {
     pub invite: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LoginBindRequest {
     pub login: String,
     pub ik_ed25519: String,
@@ -80,6 +91,7 @@ pub struct LoginBindRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LoginLookupRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub login: Option<String>,
@@ -88,11 +100,13 @@ pub struct LoginLookupRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct MsgSendRequest {
     pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct E2eMsgAd {
     pub pv: u8,
     pub session_id: Uuid,
@@ -101,6 +115,7 @@ pub struct E2eMsgAd {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct E2eMsgSendRequest {
     pub session_id: Uuid,
     pub n: u64,
@@ -114,12 +129,15 @@ pub struct E2eMsgSendRequest {
 pub type E2eMsgRecvEvent = E2eMsgSendRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SessionLeaveRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PingRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SignedPrekey {
     pub id: u32,
     pub x25519: String,
@@ -128,12 +146,14 @@ pub struct SignedPrekey {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct OneTimePrekey {
     pub id: u32,
     pub x25519: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PrekeyPublishRequest {
     pub ik_ed25519: String,
     pub spk: SignedPrekey,
@@ -141,11 +161,13 @@ pub struct PrekeyPublishRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PrekeyGetRequest {
     pub session_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct HandshakeInitRequest {
     pub session_id: Uuid,
     pub hs_id: Uuid,
@@ -160,6 +182,7 @@ pub struct HandshakeInitRequest {
 pub type HandshakeInitRecvEvent = HandshakeInitRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct HandshakeAcceptRequest {
     pub session_id: Uuid,
     pub hs_id: Uuid,
@@ -172,20 +195,24 @@ pub struct HandshakeAcceptRequest {
 pub type HandshakeAcceptRecvEvent = HandshakeAcceptRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ReadyEvent {
     pub server_time: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct InviteCreatedEvent {
     pub invite: String,
     pub expires_in: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct InviteUsedEvent {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LoginBindingEvent {
     pub login: String,
     pub ik_ed25519: String,
@@ -194,12 +221,14 @@ pub struct LoginBindingEvent {
 pub type LoginBoundEvent = LoginBindingEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SessionStartedEvent {
     pub session_id: Uuid,
     pub peer: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct MsgRecvEvent {
     pub session_id: Uuid,
     pub text: String,
@@ -214,18 +243,21 @@ pub enum SessionEndReason {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SessionEndedEvent {
     pub session_id: Uuid,
     pub reason: SessionEndReason,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PrekeyPublishedEvent {
     pub spk_id: u32,
     pub opk_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PublicPrekeyBundle {
     pub ik_ed25519: String,
     pub spk: SignedPrekey,
@@ -233,6 +265,7 @@ pub struct PublicPrekeyBundle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PrekeyBundleEvent {
     pub session_id: Uuid,
     pub peer: PublicPrekeyBundle,
@@ -250,6 +283,7 @@ pub enum RateLimitScope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitedEvent {
     pub scope: RateLimitScope,
     pub retry_after_ms: u64,
@@ -281,12 +315,14 @@ pub enum ErrorCode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorEvent {
     pub code: ErrorCode,
     pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PongEvent {}
 
 #[cfg(test)]
@@ -305,6 +341,7 @@ mod tests {
 
         let raw = serde_json::to_value(&msg).expect("serialize envelope");
 
+        assert_eq!(raw["pv"], 2);
         assert_eq!(raw["t"], names::INVITE_USE);
         assert_eq!(raw["rid"], "req-1");
         assert_eq!(raw["d"]["invite"], "DL1:abc.def");
@@ -333,9 +370,19 @@ mod tests {
         .with_request_id("req-e2e");
 
         let raw = serde_json::to_value(&msg).expect("serialize envelope");
+        assert_eq!(raw["pv"], 2);
         assert_eq!(raw["t"], names::E2E_MSG_SEND);
         assert_eq!(raw["rid"], "req-e2e");
         assert_eq!(raw["d"]["session_id"], session_id.to_string());
         assert_eq!(raw["d"]["ad"]["pv"], 2);
+    }
+
+    #[test]
+    fn envelope_deserializes_legacy_payload_without_pv() {
+        let raw = r#"{"t":"invite.use","rid":"req-1","d":{"invite":"DL1:abc.def"}}"#;
+        let parsed =
+            serde_json::from_str::<Envelope<InviteUseRequest>>(raw).expect("parse envelope");
+        assert_eq!(parsed.protocol_version, 2);
+        assert_eq!(parsed.event_type, names::INVITE_USE);
     }
 }

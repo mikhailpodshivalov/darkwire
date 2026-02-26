@@ -167,6 +167,9 @@ pub fn handle_server_text(raw: &str, state: &mut ClientState) -> Option<String> 
             }
         }
         events::names::E2E_MSG_RECV => {
+            if serde_json::from_value::<E2eMsgRecvEvent>(envelope.data).is_err() {
+                return Some(format!("[e2e:{rid}] invalid encrypted payload from server"));
+            }
             return None;
         }
         events::names::LOGIN_BOUND | events::names::LOGIN_BINDING => {
@@ -322,5 +325,24 @@ mod tests {
             extract_wire_action(&raw),
             Some(WireAction::Error { .. })
         ));
+    }
+
+    #[test]
+    fn malformed_e2e_payload_surfaces_warning_line() {
+        let raw = serde_json::json!({
+            "pv": 2,
+            "t": events::names::E2E_MSG_RECV,
+            "rid": "srv-7",
+            "d": {
+                "session_id": Uuid::new_v4(),
+                "n": 1,
+                "pn": 0
+            }
+        })
+        .to_string();
+
+        let mut state = ClientState::default();
+        let line = handle_server_text(&raw, &mut state).expect("warning line");
+        assert!(line.contains("invalid encrypted payload"));
     }
 }

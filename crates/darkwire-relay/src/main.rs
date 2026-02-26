@@ -77,10 +77,10 @@ mod tests {
     use darkwire_protocol::events::{
         self, E2eMsgAd, E2eMsgSendRequest, Envelope, ErrorCode, ErrorEvent, HandshakeAcceptRequest,
         HandshakeInitRequest, InviteCreateRequest, InviteCreatedEvent, InviteUseRequest,
-        LoginBindRequest, LoginBindingEvent, LoginLookupRequest, MsgRecvEvent, MsgSendRequest,
-        OneTimePrekey, PrekeyBundleEvent, PrekeyGetRequest, PrekeyPublishRequest,
-        PrekeyPublishedEvent, RateLimitScope, RateLimitedEvent, SessionEndReason,
-        SessionEndedEvent, SessionStartedEvent, SignedPrekey,
+        LoginBindRequest, LoginBindingEvent, LoginLookupRequest, MsgSendRequest, OneTimePrekey,
+        PrekeyBundleEvent, PrekeyGetRequest, PrekeyPublishRequest, PrekeyPublishedEvent,
+        RateLimitScope, RateLimitedEvent, SessionEndReason, SessionEndedEvent, SessionStartedEvent,
+        SignedPrekey,
     };
     use darkwire_protocol::login::login_bind_transcript;
     use futures_util::{SinkExt, StreamExt};
@@ -100,6 +100,7 @@ mod tests {
         time::{sleep, timeout},
     };
     use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+    use uuid::Uuid;
 
     type WsClient = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -221,7 +222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integration_two_clients_can_chat_and_disconnect_ends_session() {
+    async fn integration_plaintext_msg_send_is_rejected_with_e2e_required() {
         let (addr, shutdown_tx, server_task) = spawn_test_relay(LimitsConfig::default()).await;
 
         let mut inviter = connect_client(addr).await;
@@ -293,11 +294,11 @@ mod tests {
         )
         .await;
 
-        let received = recv_until(&mut joiner, events::names::MSG_RECV).await;
-        let received_msg = serde_json::from_value::<MsgRecvEvent>(received.data)
-            .expect("msg.recv payload should parse");
-        assert_eq!(received_msg.session_id, inviter_session);
-        assert_eq!(received_msg.text, "hello from inviter");
+        let plaintext_err = recv_until(&mut inviter, events::names::ERROR).await;
+        assert_eq!(plaintext_err.request_id.as_deref(), Some("req-msg"));
+        let payload = serde_json::from_value::<ErrorEvent>(plaintext_err.data)
+            .expect("error payload should parse");
+        assert_eq!(payload.code, ErrorCode::E2eRequired);
 
         joiner
             .send(Message::Close(None))
@@ -367,9 +368,9 @@ mod tests {
             session_id,
             n: 1,
             pn: 0,
-            dh_x25519: "A".repeat(43),
-            nonce: "BBBBBBBBBBBBBBBB".to_string(),
-            ct: "ciphertext_payload".to_string(),
+            dh_x25519: URL_SAFE_NO_PAD.encode([7_u8; 32]),
+            nonce: URL_SAFE_NO_PAD.encode([9_u8; 12]),
+            ct: URL_SAFE_NO_PAD.encode([11_u8; 24]),
             ad: E2eMsgAd {
                 pv: 2,
                 session_id,
@@ -394,6 +395,79 @@ mod tests {
         assert_eq!(inbound.ct, outbound.ct);
         assert_eq!(inbound.nonce, outbound.nonce);
         assert_eq!(inbound.ad, outbound.ad);
+
+        let _ = shutdown_tx.send(());
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn integration_e2e_event_without_pv_is_rejected() {
+        let (addr, shutdown_tx, server_task) = spawn_test_relay(LimitsConfig::default()).await;
+        let mut client = connect_client(addr).await;
+
+        assert_eq!(
+            recv_with_timeout(&mut client).await.event_type,
+            events::names::READY
+        );
+
+        let session_id = Uuid::new_v4();
+        let raw = format!(
+            r#"{{"t":"{}","rid":"req-pv","d":{{"session_id":"{}"}}}}"#,
+            events::names::E2E_PREKEY_GET,
+            session_id
+        );
+        send_raw_event(&mut client, raw).await;
+
+        let error = recv_until(&mut client, events::names::ERROR).await;
+        assert_eq!(error.request_id.as_deref(), Some("req-pv"));
+        let payload =
+            serde_json::from_value::<ErrorEvent>(error.data).expect("error payload should parse");
+        assert_eq!(payload.code, ErrorCode::UnsupportedProtocol);
+
+        let _ = shutdown_tx.send(());
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn integration_e2e_msg_send_with_unknown_field_is_rejected() {
+        let (addr, shutdown_tx, server_task) = spawn_test_relay(LimitsConfig::default()).await;
+        let mut client = connect_client(addr).await;
+
+        assert_eq!(
+            recv_with_timeout(&mut client).await.event_type,
+            events::names::READY
+        );
+
+        let session_id = Uuid::new_v4();
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "n": 1,
+            "pn": 0,
+            "dh_x25519": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "nonce": "BBBBBBBBBBBBBBBB",
+            "ct": "Q0NDQw",
+            "ad": {
+                "pv": 2,
+                "session_id": session_id,
+                "n": 1,
+                "pn": 0
+            },
+            "unexpected": 1
+        });
+        let raw = serde_json::json!({
+            "pv": 2,
+            "t": events::names::E2E_MSG_SEND,
+            "rid": "req-unknown-field",
+            "d": payload
+        })
+        .to_string();
+        send_raw_event(&mut client, raw).await;
+
+        let error = recv_until(&mut client, events::names::ERROR).await;
+        assert_eq!(error.request_id.as_deref(), Some("req-unknown-field"));
+        let payload =
+            serde_json::from_value::<ErrorEvent>(error.data).expect("error payload should parse");
+        assert_eq!(payload.code, ErrorCode::BadRequest);
 
         let _ = shutdown_tx.send(());
         let _ = server_task.await;
@@ -929,6 +1003,13 @@ mod tests {
         )
         .expect("serialize outbound event");
 
+        client
+            .send(Message::Text(raw.into()))
+            .await
+            .expect("send websocket text event");
+    }
+
+    async fn send_raw_event(client: &mut WsClient, raw: String) {
         client
             .send(Message::Text(raw.into()))
             .await
