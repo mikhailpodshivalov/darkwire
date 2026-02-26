@@ -700,8 +700,8 @@ impl ClientRuntime {
                 is_active_peer = true;
                 self.active_peer_login = Some(login.clone());
                 self.peer_login_missing_notified = false;
-                self.print_active_trust(ui, &active);
                 if active.state == SessionTrustState::KeyChanged {
+                    self.print_active_trust(ui, &active);
                     let previous = active
                         .previous_fingerprint_short
                         .as_deref()
