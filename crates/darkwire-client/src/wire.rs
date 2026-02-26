@@ -22,8 +22,18 @@ pub enum WireAction {
     HandshakeInitRecv(HandshakeInitRequest),
     HandshakeAcceptRecv(HandshakeAcceptRequest),
     EncryptedMessage(E2eMsgRecvEvent),
-    LoginBound(LoginBindingEvent),
-    LoginBinding(LoginBindingEvent),
+    LoginBound {
+        request_id: Option<String>,
+        event: LoginBindingEvent,
+    },
+    LoginBinding {
+        request_id: Option<String>,
+        event: LoginBindingEvent,
+    },
+    Error {
+        request_id: Option<String>,
+        event: ErrorEvent,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +48,7 @@ struct IncomingEnvelope {
 
 pub fn extract_wire_action(raw: &str) -> Option<WireAction> {
     let envelope: IncomingEnvelope = serde_json::from_str(raw).ok()?;
+    let request_id = envelope.request_id.clone();
     match envelope.event_type.as_str() {
         events::names::SESSION_STARTED => {
             serde_json::from_value::<SessionStartedEvent>(envelope.data)
@@ -67,10 +78,13 @@ pub fn extract_wire_action(raw: &str) -> Option<WireAction> {
             .map(WireAction::EncryptedMessage),
         events::names::LOGIN_BOUND => serde_json::from_value::<LoginBindingEvent>(envelope.data)
             .ok()
-            .map(WireAction::LoginBound),
+            .map(|event| WireAction::LoginBound { request_id, event }),
         events::names::LOGIN_BINDING => serde_json::from_value::<LoginBindingEvent>(envelope.data)
             .ok()
-            .map(WireAction::LoginBinding),
+            .map(|event| WireAction::LoginBinding { request_id, event }),
+        events::names::ERROR => serde_json::from_value::<ErrorEvent>(envelope.data)
+            .ok()
+            .map(|event| WireAction::Error { request_id, event }),
         _ => None,
     }
 }
@@ -180,25 +194,20 @@ pub fn handle_server_text(raw: &str, state: &mut ClientState) -> Option<String> 
         }
         events::names::ERROR => {
             if let Ok(event) = serde_json::from_value::<ErrorEvent>(envelope.data) {
-                return Some(match event.code {
-                    ErrorCode::LoginNotFound => {
-                        "[login] who am i? set your login with /login set @name".to_string()
-                    }
-                    ErrorCode::LoginTaken => {
-                        "[login] this login is already taken by another identity key".to_string()
-                    }
-                    ErrorCode::LoginInvalid => {
-                        "[login] invalid login request. Use /login set @name".to_string()
-                    }
-                    ErrorCode::LoginKeyMismatch => {
-                        "[login] signature or identity mismatch. Try /keys and /login set again"
-                            .to_string()
-                    }
-                    _ => format!(
-                        "[error:{rid}] code={:?} message={}",
-                        event.code, event.message
-                    ),
-                });
+                if matches!(
+                    event.code,
+                    ErrorCode::LoginNotFound
+                        | ErrorCode::LoginTaken
+                        | ErrorCode::LoginInvalid
+                        | ErrorCode::LoginKeyMismatch
+                ) {
+                    return None;
+                }
+
+                return Some(format!(
+                    "[error:{rid}] code={:?} message={}",
+                    event.code, event.message
+                ));
             }
         }
         events::names::PONG => {
@@ -234,7 +243,7 @@ fn rate_limit_scope_name(scope: darkwire_protocol::events::RateLimitScope) -> &'
 #[cfg(test)]
 mod tests {
     use super::*;
-    use darkwire_protocol::events::{Envelope, LoginBindingEvent, SessionStartedEvent};
+    use darkwire_protocol::events::{Envelope, ErrorEvent, LoginBindingEvent, SessionStartedEvent};
 
     #[test]
     fn session_started_with_request_id_marks_local_initiator() {
@@ -284,10 +293,32 @@ mod tests {
 
         assert!(matches!(
             extract_wire_action(&raw),
-            Some(WireAction::LoginBinding(_))
+            Some(WireAction::LoginBinding { .. })
         ));
 
         let mut state = ClientState::default();
         assert!(handle_server_text(&raw, &mut state).is_none());
+    }
+
+    #[test]
+    fn login_errors_are_suppressed_for_runtime_handling() {
+        let raw = serde_json::to_string(
+            &Envelope::new(
+                events::names::ERROR,
+                ErrorEvent {
+                    code: ErrorCode::LoginNotFound,
+                    message: "login binding not found".to_string(),
+                },
+            )
+            .with_request_id("cli-3"),
+        )
+        .expect("serialize error envelope");
+
+        let mut state = ClientState::default();
+        assert!(handle_server_text(&raw, &mut state).is_none());
+        assert!(matches!(
+            extract_wire_action(&raw),
+            Some(WireAction::Error { .. })
+        ));
     }
 }

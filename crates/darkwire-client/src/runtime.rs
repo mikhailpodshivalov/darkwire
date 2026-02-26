@@ -8,12 +8,13 @@ use crate::{
     wire::{extract_wire_action, handle_server_text, ClientState, WireAction},
 };
 use darkwire_protocol::events::{
-    self, Envelope, InviteCreateRequest, InviteUseRequest, LoginBindRequest, LoginLookupRequest,
-    SessionLeaveRequest,
+    self, Envelope, ErrorCode, ErrorEvent, InviteCreateRequest, InviteUseRequest,
+    LoginBindRequest, LoginLookupRequest, SessionLeaveRequest,
 };
 use darkwire_protocol::login::{format_login, normalize_login};
 use futures_util::{stream::SplitSink, SinkExt};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::error::Error;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
@@ -28,6 +29,10 @@ pub struct ClientRuntime {
     active_peer_trust: Option<ActivePeerTrust>,
     active_peer_login: Option<String>,
     local_login: Option<String>,
+    pending_local_login_lookup: HashSet<String>,
+    pending_peer_login_lookup: HashSet<String>,
+    pending_named_login_lookup: HashSet<String>,
+    awaiting_username_entry: bool,
     request_counter: u64,
 }
 
@@ -41,6 +46,10 @@ impl ClientRuntime {
             active_peer_trust: None,
             active_peer_login: None,
             local_login: None,
+            pending_local_login_lookup: HashSet::new(),
+            pending_peer_login_lookup: HashSet::new(),
+            pending_named_login_lookup: HashSet::new(),
+            awaiting_username_entry: false,
             request_counter: 1,
         }
     }
@@ -63,7 +72,7 @@ impl ClientRuntime {
         self.publish_prekeys(ws_writer, keys).await?;
         self.request_invite(ws_writer, invite_relay, invite_ttl)
             .await?;
-        self.request_login_lookup_by_ik(ws_writer, keys.identity_public_ed25519())
+        self.request_login_lookup_by_ik(ws_writer, keys.identity_public_ed25519(), true)
             .await?;
         Ok(())
     }
@@ -77,6 +86,19 @@ impl ClientRuntime {
         invite_ttl: u32,
         keys: &mut KeyManager,
     ) -> Result<bool, Box<dyn Error>> {
+        if self.awaiting_username_entry && !line.trim().starts_with('/') {
+            let Some(login) = normalize_login(line) else {
+                ui.print_error(
+                    "[login] invalid username format; use 3-24 chars [a-z0-9_.-], optional @ prefix",
+                );
+                ui.print_line("Who are you? enter your username:");
+                return Ok(true);
+            };
+
+            self.bind_local_login(ws_writer, keys, &login, ui).await?;
+            return Ok(true);
+        }
+
         match parse_user_command(line) {
             UserCommand::Ignore => Ok(true),
             UserCommand::Help => {
@@ -134,7 +156,8 @@ impl ClientRuntime {
             }
             UserCommand::Quit => {
                 if self.state.active_session {
-                    self.send_request(
+                    let _ = self
+                        .send_request(
                         ws_writer,
                         events::names::SESSION_LEAVE,
                         SessionLeaveRequest::default(),
@@ -150,7 +173,8 @@ impl ClientRuntime {
                 Ok(true)
             }
             UserCommand::ConnectInvite(invite) => {
-                self.send_request(
+                let _ = self
+                    .send_request(
                     ws_writer,
                     events::names::INVITE_USE,
                     InviteUseRequest { invite },
@@ -222,7 +246,7 @@ impl ClientRuntime {
                 } else {
                     ui.print_line(&format!("[login] local unbound fp={local_fp}"));
                 }
-                self.request_login_lookup_by_ik(ws_writer, keys.identity_public_ed25519())
+                self.request_login_lookup_by_ik(ws_writer, keys.identity_public_ed25519(), true)
                     .await?;
                 Ok(true)
             }
@@ -233,26 +257,7 @@ impl ClientRuntime {
                     );
                     return Ok(true);
                 };
-
-                let signature = match keys.sign_login_binding(&login) {
-                    Ok(signature) => signature,
-                    Err(err) => {
-                        ui.print_error(&format!("[login] failed to sign bind request: {err}"));
-                        return Ok(true);
-                    }
-                };
-
-                self.send_request(
-                    ws_writer,
-                    events::names::LOGIN_BIND,
-                    LoginBindRequest {
-                        login: login.clone(),
-                        ik_ed25519: keys.identity_public_ed25519().to_string(),
-                        sig_ed25519: signature,
-                    },
-                )
-                .await?;
-                ui.print_line(&format!("[login] binding {} ...", format_login(&login)));
+                self.bind_local_login(ws_writer, keys, &login, ui).await?;
                 Ok(true)
             }
             UserCommand::LoginLookup(raw_login) => {
@@ -287,7 +292,8 @@ impl ClientRuntime {
                     }
                 };
 
-                self.send_request(ws_writer, events::names::E2E_MSG_SEND, payload)
+                let _ = self
+                    .send_request(ws_writer, events::names::E2E_MSG_SEND, payload)
                     .await?;
                 Ok(true)
             }
@@ -317,8 +323,12 @@ impl ClientRuntime {
                     Err(err) => ui.print_error(&format!("[e2e] drop inbound message: {err}")),
                 }
             }
-            WireAction::LoginBound(binding) | WireAction::LoginBinding(binding) => {
-                self.handle_login_binding(binding.login, binding.ik_ed25519, keys, ui);
+            WireAction::LoginBound { request_id, event }
+            | WireAction::LoginBinding { request_id, event } => {
+                self.handle_login_binding(request_id, event.login, event.ik_ed25519, keys, ui);
+            }
+            WireAction::Error { request_id, event } => {
+                self.handle_error_event(request_id, event, ui);
             }
             action => {
                 if matches!(
@@ -361,7 +371,7 @@ impl ClientRuntime {
                                 trust.fingerprint_short
                             ));
                         }
-                        self.request_login_lookup_by_ik(ws_writer, &material.peer_ik_ed25519)
+                        self.request_login_lookup_by_ik(ws_writer, &material.peer_ik_ed25519, false)
                             .await?;
                         self.active_peer_trust = Some(trust);
                     }
@@ -414,8 +424,10 @@ impl ClientRuntime {
             o: true,
         };
 
-        self.send_request(ws_writer, events::names::INVITE_CREATE, payload)
-            .await
+        let _ = self
+            .send_request(ws_writer, events::names::INVITE_CREATE, payload)
+            .await?;
+        Ok(())
     }
 
     async fn publish_prekeys(
@@ -424,8 +436,10 @@ impl ClientRuntime {
         keys: &KeyManager,
     ) -> Result<(), Box<dyn Error>> {
         let payload = keys.build_prekey_publish_request();
-        self.send_request(ws_writer, events::names::E2E_PREKEY_PUBLISH, payload)
-            .await
+        let _ = self
+            .send_request(ws_writer, events::names::E2E_PREKEY_PUBLISH, payload)
+            .await?;
+        Ok(())
     }
 
     async fn request_login_lookup_by_login(
@@ -433,7 +447,8 @@ impl ClientRuntime {
         ws_writer: &mut WsWriter,
         login: &str,
     ) -> Result<(), Box<dyn Error>> {
-        self.send_request(
+        let request_id = self
+            .send_request(
             ws_writer,
             events::names::LOGIN_LOOKUP,
             LoginLookupRequest {
@@ -441,15 +456,19 @@ impl ClientRuntime {
                 ik_ed25519: None,
             },
         )
-        .await
+        .await?;
+        self.pending_named_login_lookup.insert(request_id);
+        Ok(())
     }
 
     async fn request_login_lookup_by_ik(
         &mut self,
         ws_writer: &mut WsWriter,
         ik_ed25519: &str,
+        is_local: bool,
     ) -> Result<(), Box<dyn Error>> {
-        self.send_request(
+        let request_id = self
+            .send_request(
             ws_writer,
             events::names::LOGIN_LOOKUP,
             LoginLookupRequest {
@@ -457,7 +476,13 @@ impl ClientRuntime {
                 ik_ed25519: Some(ik_ed25519.to_string()),
             },
         )
-        .await
+        .await?;
+        if is_local {
+            self.pending_local_login_lookup.insert(request_id);
+        } else {
+            self.pending_peer_login_lookup.insert(request_id);
+        }
+        Ok(())
     }
 
     async fn send_request<T: Serialize>(
@@ -465,14 +490,14 @@ impl ClientRuntime {
         ws_writer: &mut WsWriter,
         event_type: &str,
         data: T,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<String, Box<dyn Error>> {
         let request_id = format!("cli-{}", self.request_counter);
         self.request_counter = self.request_counter.saturating_add(1);
 
-        let envelope = Envelope::new(event_type, data).with_request_id(request_id);
+        let envelope = Envelope::new(event_type, data).with_request_id(request_id.clone());
         let raw = serde_json::to_string(&envelope)?;
         ws_writer.send(Message::Text(raw.into())).await?;
-        Ok(())
+        Ok(request_id)
     }
 
     fn print_trust_status(&self, ui: &mut TerminalUi) {
@@ -503,11 +528,18 @@ impl ClientRuntime {
 
     fn handle_login_binding(
         &mut self,
+        request_id: Option<String>,
         login: String,
         ik_ed25519: String,
         keys: &KeyManager,
         ui: &mut TerminalUi,
     ) {
+        if let Some(request_id) = request_id {
+            self.pending_local_login_lookup.remove(&request_id);
+            self.pending_peer_login_lookup.remove(&request_id);
+            self.pending_named_login_lookup.remove(&request_id);
+        }
+
         let fp = fingerprint_short_for_ik(&ik_ed25519);
         let formatted = format_login(&login);
         let is_local = ik_ed25519 == keys.identity_public_ed25519();
@@ -533,6 +565,7 @@ impl ClientRuntime {
 
         if is_local {
             self.local_login = Some(login);
+            self.awaiting_username_entry = false;
             ui.print_line(&format!("[login] local {formatted} fp={fp}"));
             return;
         }
@@ -540,5 +573,73 @@ impl ClientRuntime {
         if !is_active_peer {
             ui.print_line(&format!("[login] {formatted} fp={fp}"));
         }
+    }
+
+    fn handle_error_event(
+        &mut self,
+        request_id: Option<String>,
+        event: ErrorEvent,
+        ui: &mut TerminalUi,
+    ) {
+        let request_id = request_id.unwrap_or_default();
+
+        if self.pending_local_login_lookup.remove(&request_id)
+            && event.code == ErrorCode::LoginNotFound
+            && self.local_login.is_none()
+        {
+            self.awaiting_username_entry = true;
+            ui.print_line("Who are you? enter your username:");
+            return;
+        }
+
+        if self.pending_named_login_lookup.remove(&request_id) && event.code == ErrorCode::LoginNotFound
+        {
+            ui.print_line("[login] username not found");
+            return;
+        }
+
+        if self.pending_peer_login_lookup.remove(&request_id) && event.code == ErrorCode::LoginNotFound
+        {
+            ui.print_line("[login] peer has no username yet");
+            return;
+        }
+
+        match event.code {
+            ErrorCode::LoginTaken => ui.print_error("[login] this username is already taken"),
+            ErrorCode::LoginInvalid => {
+                ui.print_error("[login] invalid username/signature; use /login set @name")
+            }
+            ErrorCode::LoginKeyMismatch => {
+                ui.print_error(
+                    "[login] signature or identity mismatch; run /keys and retry /login set @name",
+                )
+            }
+            ErrorCode::LoginNotFound => ui.print_line("[login] username not found"),
+            _ => {}
+        }
+    }
+
+    async fn bind_local_login(
+        &mut self,
+        ws_writer: &mut WsWriter,
+        keys: &KeyManager,
+        login: &str,
+        ui: &mut TerminalUi,
+    ) -> Result<(), Box<dyn Error>> {
+        let signature = keys.sign_login_binding(login)?;
+        let _ = self
+            .send_request(
+                ws_writer,
+                events::names::LOGIN_BIND,
+                LoginBindRequest {
+                    login: login.to_string(),
+                    ik_ed25519: keys.identity_public_ed25519().to_string(),
+                    sig_ed25519: signature,
+                },
+            )
+            .await?;
+        self.awaiting_username_entry = false;
+        ui.print_line(&format!("[login] binding {} ...", format_login(login)));
+        Ok(())
     }
 }
