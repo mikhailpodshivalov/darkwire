@@ -39,6 +39,7 @@ pub(super) struct ChatLine {
 #[derive(Debug)]
 pub struct TerminalUi {
     interactive: bool,
+    theme: style::UiTheme,
     input_buffer: String,
     command_matches: Vec<&'static str>,
     command_selected: usize,
@@ -50,6 +51,7 @@ impl TerminalUi {
     pub fn new(interactive: bool) -> Self {
         Self {
             interactive,
+            theme: style::UiTheme::default(),
             input_buffer: String::new(),
             command_matches: Vec::new(),
             command_selected: 0,
