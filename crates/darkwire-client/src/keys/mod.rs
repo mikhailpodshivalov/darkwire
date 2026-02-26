@@ -673,4 +673,168 @@ mod tests {
                 .expect("temp key file should always have a parent"),
         );
     }
+
+    #[test]
+    fn responder_rejects_tampered_handshake_init_signature() {
+        let key_file_a = temp_key_file();
+        let key_file_b = temp_key_file();
+        let initiator = KeyManager::load_or_init(key_file_a.clone()).expect("init A");
+        let mut responder = KeyManager::load_or_init(key_file_b.clone()).expect("init B");
+
+        let publish = responder.build_prekey_publish_request();
+        let bundle = PublicPrekeyBundle {
+            ik_ed25519: publish.ik_ed25519,
+            spk: publish.spk,
+            opk: publish.opks.first().cloned(),
+        };
+        let (mut init_request, _context) = initiator
+            .start_initiator_handshake(Uuid::new_v4(), &bundle)
+            .expect("initiator handshake start should pass");
+
+        let mut sig_bytes =
+            decode_b64u(&init_request.sig_ed25519).expect("signature should decode");
+        sig_bytes[0] ^= 0x01;
+        init_request.sig_ed25519 = encode_b64u(&sig_bytes);
+
+        let err = responder
+            .respond_to_handshake_init(&init_request)
+            .expect_err("tampered handshake.init signature must be rejected");
+        assert!(err.to_string().contains("verification failed"));
+
+        let _ = fs::remove_dir_all(
+            key_file_a
+                .parent()
+                .expect("temp key file should always have a parent"),
+        );
+        let _ = fs::remove_dir_all(
+            key_file_b
+                .parent()
+                .expect("temp key file should always have a parent"),
+        );
+    }
+
+    #[test]
+    fn initiator_rejects_tampered_handshake_accept_signature() {
+        let key_file_a = temp_key_file();
+        let key_file_b = temp_key_file();
+        let initiator = KeyManager::load_or_init(key_file_a.clone()).expect("init A");
+        let mut responder = KeyManager::load_or_init(key_file_b.clone()).expect("init B");
+
+        let publish = responder.build_prekey_publish_request();
+        let bundle = PublicPrekeyBundle {
+            ik_ed25519: publish.ik_ed25519,
+            spk: publish.spk,
+            opk: publish.opks.first().cloned(),
+        };
+
+        let (init_request, context) = initiator
+            .start_initiator_handshake(Uuid::new_v4(), &bundle)
+            .expect("initiator handshake start should pass");
+        let (mut accept_request, _responder_material) = responder
+            .respond_to_handshake_init(&init_request)
+            .expect("responder should accept handshake init");
+
+        let mut sig_bytes =
+            decode_b64u(&accept_request.sig_ed25519).expect("signature should decode");
+        sig_bytes[0] ^= 0x01;
+        accept_request.sig_ed25519 = encode_b64u(&sig_bytes);
+
+        let err = initiator
+            .finalize_initiator_handshake(&context, &accept_request)
+            .expect_err("tampered handshake.accept signature must be rejected");
+        assert!(err.to_string().contains("verification failed"));
+
+        let _ = fs::remove_dir_all(
+            key_file_a
+                .parent()
+                .expect("temp key file should always have a parent"),
+        );
+        let _ = fs::remove_dir_all(
+            key_file_b
+                .parent()
+                .expect("temp key file should always have a parent"),
+        );
+    }
+
+    #[test]
+    fn initiator_rejects_tampered_handshake_accept_key_confirmation() {
+        let key_file_a = temp_key_file();
+        let key_file_b = temp_key_file();
+        let initiator = KeyManager::load_or_init(key_file_a.clone()).expect("init A");
+        let mut responder = KeyManager::load_or_init(key_file_b.clone()).expect("init B");
+
+        let publish = responder.build_prekey_publish_request();
+        let bundle = PublicPrekeyBundle {
+            ik_ed25519: publish.ik_ed25519,
+            spk: publish.spk,
+            opk: publish.opks.first().cloned(),
+        };
+
+        let (init_request, mut context) = initiator
+            .start_initiator_handshake(Uuid::new_v4(), &bundle)
+            .expect("initiator handshake start should pass");
+        let (accept_request, _responder_material) = responder
+            .respond_to_handshake_init(&init_request)
+            .expect("responder should accept handshake init");
+        // Simulate MITM tampering in initiator-side prekey selection state: signature stays valid
+        // but initiator derives a different root key and must reject accept via key confirmation.
+        context.peer_opk_x25519_b64u = None;
+
+        let err = initiator
+            .finalize_initiator_handshake(&context, &accept_request)
+            .expect_err("tampered key confirmation must be rejected");
+        assert!(err.to_string().contains("key confirmation mismatch"));
+
+        let _ = fs::remove_dir_all(
+            key_file_a
+                .parent()
+                .expect("temp key file should always have a parent"),
+        );
+        let _ = fs::remove_dir_all(
+            key_file_b
+                .parent()
+                .expect("temp key file should always have a parent"),
+        );
+    }
+
+    #[test]
+    fn initiator_rejects_handshake_accept_identity_substitution() {
+        let key_file_a = temp_key_file();
+        let key_file_b = temp_key_file();
+        let initiator = KeyManager::load_or_init(key_file_a.clone()).expect("init A");
+        let mut responder = KeyManager::load_or_init(key_file_b.clone()).expect("init B");
+
+        let publish = responder.build_prekey_publish_request();
+        let bundle = PublicPrekeyBundle {
+            ik_ed25519: publish.ik_ed25519,
+            spk: publish.spk,
+            opk: publish.opks.first().cloned(),
+        };
+
+        let (init_request, context) = initiator
+            .start_initiator_handshake(Uuid::new_v4(), &bundle)
+            .expect("initiator handshake start should pass");
+        let (mut accept_request, _responder_material) = responder
+            .respond_to_handshake_init(&init_request)
+            .expect("responder should accept handshake init");
+        accept_request.responder_ik_ed25519 = initiator.identity_public_ed25519().to_string();
+
+        let err = initiator
+            .finalize_initiator_handshake(&context, &accept_request)
+            .expect_err("identity substitution must be rejected");
+        assert!(err
+            .to_string()
+            .contains("identity key does not match expected peer"));
+
+        let _ = fs::remove_dir_all(
+            key_file_a
+                .parent()
+                .expect("temp key file should always have a parent"),
+        );
+        let _ = fs::remove_dir_all(
+            key_file_b
+                .parent()
+                .expect("temp key file should always have a parent"),
+        );
+    }
 }
