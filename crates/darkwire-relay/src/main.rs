@@ -153,6 +153,7 @@ mod tests {
                 r: vec![relay_url(addr)],
                 e: 600,
                 o: true,
+                k: None,
             },
         )
         .await;
@@ -246,6 +247,7 @@ mod tests {
                 r: vec![relay_url(addr)],
                 e: 600,
                 o: true,
+                k: None,
             },
         )
         .await;
@@ -379,6 +381,7 @@ mod tests {
                 r: vec![relay_url(addr)],
                 e: 600,
                 o: true,
+                k: None,
             },
         )
         .await;
@@ -512,6 +515,7 @@ mod tests {
                 r: vec![relay_url(addr)],
                 e: 600,
                 o: true,
+                k: None,
             },
         )
         .await;
@@ -628,6 +632,7 @@ mod tests {
                 r: vec![relay_url(addr)],
                 e: 600,
                 o: true,
+                k: None,
             },
         )
         .await;

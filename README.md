@@ -162,6 +162,12 @@ Wait for `[e2e] secure session established ...` before sending messages.
 - Signed prekey auto-rotates on expiry; OPK pool auto-refills when low.
 - Client auto-publishes prekey bundle on startup and after `/keys rotate|refill|revoke`.
 
+### Secure session persistence (Phase 2.11 baseline)
+- Client stores encrypted-session checkpoints locally in `~/.darkwire/sessions.json` (restricted permissions on Unix).
+- On `/c CODE`, client attempts secure auto-resume from local checkpoint when invite contains peer identity hint.
+- If auto-resume is not possible, client falls back to normal `prekey.get -> handshake.init/accept` flow.
+- On local identity revoke (`/keys revoke`), stored session checkpoints are cleared.
+
 ## Demo scenario (manual)
 1. Start relay.
 2. Start client A and copy startup invite code.

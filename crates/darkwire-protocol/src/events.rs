@@ -63,6 +63,8 @@ pub struct InviteCreateRequest {
     pub r: Vec<String>,
     pub e: u32,
     pub o: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub k: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

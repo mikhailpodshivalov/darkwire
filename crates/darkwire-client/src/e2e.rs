@@ -23,11 +23,22 @@ pub struct SecureMessenger {
 #[derive(Debug)]
 struct SecureMessagingSession {
     session_id: Uuid,
+    role: HandshakeRole,
+    root_key_b64u: String,
     send_key: [u8; 32],
     recv_key: [u8; 32],
     send_dh_x25519_b64u: String,
     send_n: u64,
     recv_n: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureSessionSnapshot {
+    pub session_id: Uuid,
+    pub role: HandshakeRole,
+    pub root_key_b64u: String,
+    pub send_n: u64,
+    pub recv_n: u64,
 }
 
 #[derive(Debug)]
@@ -81,28 +92,34 @@ impl SecureMessenger {
         &mut self,
         material: &SecureSessionMaterial,
     ) -> Result<(), SecureMessagingError> {
-        let root_key = decode_b64u_fixed_32(&material.root_key_b64u)
-            .map_err(|_| SecureMessagingError::InvalidRootKey)?;
+        self.activate_with_root_key(
+            material.session_id,
+            material.role,
+            &material.root_key_b64u,
+            0,
+            0,
+        )
+    }
 
-        let (send_context, recv_context) = match material.role {
-            HandshakeRole::Initiator => (DIR_INITIATOR_TO_RESPONDER, DIR_RESPONDER_TO_INITIATOR),
-            HandshakeRole::Responder => (DIR_RESPONDER_TO_INITIATOR, DIR_INITIATOR_TO_RESPONDER),
-        };
+    pub fn activate_resumed(
+        &mut self,
+        session_id: Uuid,
+        role: HandshakeRole,
+        root_key_b64u: &str,
+        send_n: u64,
+        recv_n: u64,
+    ) -> Result<(), SecureMessagingError> {
+        self.activate_with_root_key(session_id, role, root_key_b64u, send_n, recv_n)
+    }
 
-        let send_key = derive_32(send_context, &root_key, None);
-        let recv_key = derive_32(recv_context, &root_key, None);
-        let send_dh_x25519_b64u = encode_b64u(&derive_32(CHAIN_PUBLIC_CONTEXT, &send_key, None));
-
-        self.session = Some(SecureMessagingSession {
-            session_id: material.session_id,
-            send_key,
-            recv_key,
-            send_dh_x25519_b64u,
-            send_n: 0,
-            recv_n: 0,
-        });
-
-        Ok(())
+    pub fn snapshot(&self) -> Option<SecureSessionSnapshot> {
+        self.session.as_ref().map(|session| SecureSessionSnapshot {
+            session_id: session.session_id,
+            role: session.role,
+            root_key_b64u: session.root_key_b64u.clone(),
+            send_n: session.send_n,
+            recv_n: session.recv_n,
+        })
     }
 
     pub fn encrypt_outgoing(
@@ -209,6 +226,39 @@ impl SecureMessenger {
             String::from_utf8(plaintext.to_vec()).map_err(|_| SecureMessagingError::InvalidUtf8)?;
         session.recv_n = event.n;
         Ok(message)
+    }
+
+    fn activate_with_root_key(
+        &mut self,
+        session_id: Uuid,
+        role: HandshakeRole,
+        root_key_b64u: &str,
+        send_n: u64,
+        recv_n: u64,
+    ) -> Result<(), SecureMessagingError> {
+        let root_key = decode_b64u_fixed_32(root_key_b64u)
+            .map_err(|_| SecureMessagingError::InvalidRootKey)?;
+        let (send_context, recv_context) = match role {
+            HandshakeRole::Initiator => (DIR_INITIATOR_TO_RESPONDER, DIR_RESPONDER_TO_INITIATOR),
+            HandshakeRole::Responder => (DIR_RESPONDER_TO_INITIATOR, DIR_INITIATOR_TO_RESPONDER),
+        };
+
+        let send_key = derive_32(send_context, &root_key, None);
+        let recv_key = derive_32(recv_context, &root_key, None);
+        let send_dh_x25519_b64u = encode_b64u(&derive_32(CHAIN_PUBLIC_CONTEXT, &send_key, None));
+
+        self.session = Some(SecureMessagingSession {
+            session_id,
+            role,
+            root_key_b64u: root_key_b64u.to_string(),
+            send_key,
+            recv_key,
+            send_dh_x25519_b64u,
+            send_n,
+            recv_n,
+        });
+
+        Ok(())
     }
 }
 
@@ -326,5 +376,65 @@ mod tests {
             .decrypt_incoming(&encrypted)
             .expect_err("replay must fail");
         assert!(matches!(replay, SecureMessagingError::ReplayDetected(1)));
+    }
+
+    #[test]
+    fn resume_restores_counters_for_new_transport_session() {
+        let init_material = material_for(HandshakeRole::Initiator);
+        let mut resp_material = material_for(HandshakeRole::Responder);
+        resp_material.session_id = init_material.session_id;
+        resp_material.hs_id = init_material.hs_id;
+        resp_material.root_key_b64u = init_material.root_key_b64u.clone();
+
+        let mut initiator = SecureMessenger::default();
+        let mut responder = SecureMessenger::default();
+        initiator
+            .activate(&init_material)
+            .expect("activate initiator");
+        responder
+            .activate(&resp_material)
+            .expect("activate responder");
+
+        let first = initiator.encrypt_outgoing("first").expect("encrypt first");
+        let _ = responder.decrypt_incoming(&first).expect("decrypt first");
+
+        let second = responder
+            .encrypt_outgoing("second")
+            .expect("encrypt second");
+        let _ = initiator.decrypt_incoming(&second).expect("decrypt second");
+
+        let init_snapshot = initiator.snapshot().expect("initiator snapshot");
+        let resp_snapshot = responder.snapshot().expect("responder snapshot");
+        let resumed_session_id = Uuid::new_v4();
+
+        let mut resumed_initiator = SecureMessenger::default();
+        let mut resumed_responder = SecureMessenger::default();
+        resumed_initiator
+            .activate_resumed(
+                resumed_session_id,
+                HandshakeRole::Initiator,
+                &init_snapshot.root_key_b64u,
+                init_snapshot.send_n,
+                init_snapshot.recv_n,
+            )
+            .expect("resume initiator");
+        resumed_responder
+            .activate_resumed(
+                resumed_session_id,
+                HandshakeRole::Responder,
+                &resp_snapshot.root_key_b64u,
+                resp_snapshot.send_n,
+                resp_snapshot.recv_n,
+            )
+            .expect("resume responder");
+
+        let resumed_message = resumed_initiator
+            .encrypt_outgoing("after-resume")
+            .expect("encrypt after resume");
+        assert_eq!(resumed_message.n, init_snapshot.send_n + 1);
+        let decrypted = resumed_responder
+            .decrypt_incoming(&resumed_message)
+            .expect("decrypt after resume");
+        assert_eq!(decrypted, "after-resume");
     }
 }

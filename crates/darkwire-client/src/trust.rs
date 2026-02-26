@@ -90,6 +90,12 @@ impl TrustManager {
             .collect()
     }
 
+    pub fn is_verified(&self, peer_ik_ed25519: &str) -> bool {
+        self.store
+            .verified_peer_ik_ed25519
+            .contains(peer_ik_ed25519)
+    }
+
     pub fn evaluate_peer(
         &mut self,
         peer_ik_ed25519: &str,

@@ -4,6 +4,7 @@ mod config;
 mod e2e;
 mod keys;
 mod runtime;
+mod session_store;
 mod trust;
 mod ui;
 mod wire;
@@ -16,6 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use keys::{default_key_file_path, KeyManager};
 use runtime::ClientRuntime;
 use serde::Serialize;
+use session_store::{default_session_store_path, SessionStore};
 use std::{error::Error, io::IsTerminal};
 use tokio::{
     io::AsyncBufReadExt,
@@ -62,8 +64,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let trust_file = default_trust_file_path(keys.key_file());
     let trust = TrustManager::load_or_init(trust_file)?;
-    let mut runtime = ClientRuntime::new(trust);
+    let session_store_file = default_session_store_path(keys.key_file());
+    let session_store =
+        SessionStore::load_or_init(session_store_file, keys.identity_public_ed25519())?;
+    let mut runtime = ClientRuntime::new(trust, session_store);
     ui.print_line(&runtime.trust_overview_line());
+    ui.print_line(&runtime.session_resume_overview_line());
     runtime
         .initialize_session(&mut ws_writer, &keys, &invite_relay, invite_ttl)
         .await?;

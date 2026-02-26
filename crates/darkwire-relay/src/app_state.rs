@@ -371,7 +371,7 @@ impl AppState {
             c: token.clone(),
             e: req.e,
             o: req.o,
-            k: None,
+            k: req.k,
         };
 
         let invite = encode_invite(&payload).map_err(|_| InviteCreateError::InvalidRequest)?;
@@ -1239,6 +1239,7 @@ mod tests {
                     r: vec!["ws://127.0.0.1:7000".to_string()],
                     e: 600,
                     o: true,
+                    k: None,
                 },
             )
             .await
@@ -1270,6 +1271,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invite_create_embeds_identity_hint_when_provided() {
+        let state = AppState::new(LimitsConfig::default());
+        let (tx, _rx) = channel();
+        let inviter = state.register_connection(test_ip(9), tx).await;
+        let ik_hint = "ik_hint_test_value";
+
+        let created = state
+            .create_invite(
+                inviter,
+                test_ip(9),
+                InviteCreateRequest {
+                    r: vec!["ws://127.0.0.1:7000".to_string()],
+                    e: 600,
+                    o: true,
+                    k: Some(ik_hint.to_string()),
+                },
+            )
+            .await
+            .expect("invite create should pass");
+
+        let decoded = decode_invite(&created.invite).expect("created invite should decode");
+        assert_eq!(decoded.k.as_deref(), Some(ik_hint));
+    }
+
+    #[tokio::test]
     async fn invite_use_rejects_expired_invite() {
         let state = AppState::new(LimitsConfig::default());
 
@@ -1286,6 +1312,7 @@ mod tests {
                     r: vec!["ws://127.0.0.1:7000".to_string()],
                     e: 1,
                     o: true,
+                    k: None,
                 },
             )
             .await
@@ -1322,6 +1349,7 @@ mod tests {
                     r: vec!["ws://127.0.0.1:7000".to_string()],
                     e: 600,
                     o: true,
+                    k: None,
                 },
             )
             .await
@@ -1335,6 +1363,7 @@ mod tests {
                     r: vec!["ws://127.0.0.1:7000".to_string()],
                     e: 600,
                     o: true,
+                    k: None,
                 },
             )
             .await
@@ -1384,6 +1413,7 @@ mod tests {
                     r: vec!["ws://127.0.0.1:7000".to_string()],
                     e: 600,
                     o: true,
+                    k: None,
                 },
             )
             .await
@@ -1439,6 +1469,7 @@ mod tests {
                     r: vec!["ws://127.0.0.1:7000".to_string()],
                     e: 600,
                     o: true,
+                    k: None,
                 },
             )
             .await
@@ -1483,6 +1514,7 @@ mod tests {
                     r: vec!["ws://127.0.0.1:7000".to_string()],
                     e: 600,
                     o: true,
+                    k: None,
                 },
             )
             .await
@@ -1536,6 +1568,7 @@ mod tests {
                     r: vec!["ws://127.0.0.1:7000".to_string()],
                     e: 600,
                     o: true,
+                    k: None,
                 },
             )
             .await
@@ -1596,6 +1629,7 @@ mod tests {
                     r: vec!["ws://127.0.0.1:7000".to_string()],
                     e: 600,
                     o: true,
+                    k: None,
                 },
             )
             .await
@@ -1659,6 +1693,7 @@ mod tests {
                     r: vec!["ws://127.0.0.1:7000".to_string()],
                     e: 600,
                     o: true,
+                    k: None,
                 },
             )
             .await
@@ -1745,6 +1780,7 @@ mod tests {
                     r: vec!["ws://127.0.0.1:7000".to_string()],
                     e: 600,
                     o: true,
+                    k: None,
                 },
             )
             .await
@@ -1828,6 +1864,7 @@ mod tests {
                     r: vec!["ws://127.0.0.1:7000".to_string()],
                     e: 600,
                     o: true,
+                    k: None,
                 },
             )
             .await
