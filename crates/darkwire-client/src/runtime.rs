@@ -700,9 +700,8 @@ impl ClientRuntime {
         match ui.copy_to_clipboard(invite) {
             Ok(()) => ui.print_line("[invite] copied to clipboard"),
             Err(err) => {
-                ui.print_error(&format!(
-                    "[invite] clipboard copy failed: {err}; retry /my invite copy"
-                ));
+                ui.print_error(&format!("[invite] clipboard copy not confirmed: {err}"));
+                ui.print_line(&format!("[invite] code {invite}"));
             }
         }
     }
