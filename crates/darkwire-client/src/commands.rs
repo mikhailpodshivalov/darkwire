@@ -99,6 +99,12 @@ pub fn parse_user_command(line: &str) -> UserCommand {
                 (Some("lookup"), Some(login)) => {
                     return UserCommand::LoginLookup(login.to_string());
                 }
+                (Some(compact), None) if compact.starts_with("set@") && compact.len() > 4 => {
+                    return UserCommand::LoginSet(format!("@{}", &compact[4..]));
+                }
+                (Some(compact), None) if compact.starts_with("lookup@") && compact.len() > 7 => {
+                    return UserCommand::LoginLookup(format!("@{}", &compact[7..]));
+                }
                 _ => {}
             }
         }
@@ -271,6 +277,22 @@ mod tests {
         assert_eq!(
             parse_user_command("/login lookup mike"),
             UserCommand::LoginLookup("mike".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_command_login_set_compact() {
+        assert_eq!(
+            parse_user_command("/login set@mike"),
+            UserCommand::LoginSet("@mike".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_command_login_lookup_compact() {
+        assert_eq!(
+            parse_user_command("/login lookup@mike"),
+            UserCommand::LoginLookup("@mike".to_string())
         );
     }
 

@@ -63,6 +63,8 @@ impl ClientRuntime {
         self.publish_prekeys(ws_writer, keys).await?;
         self.request_invite(ws_writer, invite_relay, invite_ttl)
             .await?;
+        self.request_login_lookup_by_ik(ws_writer, keys.identity_public_ed25519())
+            .await?;
         Ok(())
     }
 
@@ -508,14 +510,12 @@ impl ClientRuntime {
     ) {
         let fp = fingerprint_short_for_ik(&ik_ed25519);
         let formatted = format_login(&login);
-        if ik_ed25519 == keys.identity_public_ed25519() {
-            self.local_login = Some(login);
-            ui.print_line(&format!("[login] local {formatted} fp={fp}"));
-            return;
-        }
+        let is_local = ik_ed25519 == keys.identity_public_ed25519();
+        let mut is_active_peer = false;
 
         if let Some(active) = self.active_peer_trust.clone() {
             if active.peer_ik_ed25519 == ik_ed25519 {
+                is_active_peer = true;
                 self.active_peer_login = Some(login.clone());
                 self.print_active_trust(ui, &active);
                 if active.state == SessionTrustState::KeyChanged {
@@ -528,10 +528,17 @@ impl ClientRuntime {
                         active.fingerprint_short
                     ));
                 }
-                return;
             }
         }
 
-        ui.print_line(&format!("[login] {formatted} fp={fp}"));
+        if is_local {
+            self.local_login = Some(login);
+            ui.print_line(&format!("[login] local {formatted} fp={fp}"));
+            return;
+        }
+
+        if !is_active_peer {
+            ui.print_line(&format!("[login] {formatted} fp={fp}"));
+        }
     }
 }

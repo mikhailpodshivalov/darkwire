@@ -1,5 +1,5 @@
 use darkwire_protocol::events::{
-    self, E2eMsgRecvEvent, ErrorEvent, HandshakeAcceptRequest, HandshakeInitRequest,
+    self, E2eMsgRecvEvent, ErrorCode, ErrorEvent, HandshakeAcceptRequest, HandshakeInitRequest,
     InviteCreatedEvent, LoginBindingEvent, MsgRecvEvent, PrekeyBundleEvent, PrekeyPublishedEvent,
     RateLimitedEvent, ReadyEvent, SessionEndReason, SessionEndedEvent, SessionStartedEvent,
 };
@@ -180,10 +180,25 @@ pub fn handle_server_text(raw: &str, state: &mut ClientState) -> Option<String> 
         }
         events::names::ERROR => {
             if let Ok(event) = serde_json::from_value::<ErrorEvent>(envelope.data) {
-                return Some(format!(
-                    "[error:{rid}] code={:?} message={}",
-                    event.code, event.message
-                ));
+                return Some(match event.code {
+                    ErrorCode::LoginNotFound => {
+                        "[login] who am i? set your login with /login set @name".to_string()
+                    }
+                    ErrorCode::LoginTaken => {
+                        "[login] this login is already taken by another identity key".to_string()
+                    }
+                    ErrorCode::LoginInvalid => {
+                        "[login] invalid login request. Use /login set @name".to_string()
+                    }
+                    ErrorCode::LoginKeyMismatch => {
+                        "[login] signature or identity mismatch. Try /keys and /login set again"
+                            .to_string()
+                    }
+                    _ => format!(
+                        "[error:{rid}] code={:?} message={}",
+                        event.code, event.message
+                    ),
+                });
             }
         }
         events::names::PONG => {
