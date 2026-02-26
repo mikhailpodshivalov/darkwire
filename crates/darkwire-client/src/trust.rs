@@ -11,7 +11,8 @@ use std::{
 };
 
 const TRUSTSTORE_VERSION: u32 = 1;
-const DEFAULT_TRUST_FILE: &str = "trust.json";
+const DEFAULT_KEY_STEM: &str = "keys";
+const TRUST_FILE_SUFFIX: &str = "trust.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionTrustState {
@@ -189,11 +190,16 @@ impl TrustStoreFile {
 }
 
 pub fn default_trust_file_path(key_file: &Path) -> PathBuf {
-    key_file
+    let parent = key_file
         .parent()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(DEFAULT_TRUST_FILE)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = key_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(DEFAULT_KEY_STEM);
+    parent.join(format!("{stem}.{TRUST_FILE_SUFFIX}"))
 }
 
 pub fn fingerprint_short_for_ik(ik_ed25519_b64u: &str) -> String {
@@ -383,6 +389,18 @@ mod tests {
             trust_file
                 .parent()
                 .expect("temp trust file should have a parent"),
+        );
+    }
+
+    #[test]
+    fn default_trust_file_path_is_keyfile_scoped() {
+        assert_eq!(
+            default_trust_file_path(Path::new("/tmp/keys-a.json")),
+            PathBuf::from("/tmp/keys-a.trust.json")
+        );
+        assert_eq!(
+            default_trust_file_path(Path::new("keys.json")),
+            PathBuf::from("keys.trust.json")
         );
     }
 }
