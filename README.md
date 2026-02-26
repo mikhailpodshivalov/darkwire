@@ -39,6 +39,10 @@ xattr -dr com.apple.quarantine darkwire-macos-arm64
 ```
 7. Both sides wait for `secure session established`, then type normal text.
 
+### Demo
+
+![Darkwire terminal chat demo](docs/images/chat-demo.jpeg)
+
 ### Option B: Run your own relay + clients locally
 Requirements:
 - Rust + Cargo
