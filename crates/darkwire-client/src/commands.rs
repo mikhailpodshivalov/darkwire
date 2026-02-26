@@ -189,6 +189,29 @@ pub fn command_help_all_lines() -> &'static [&'static str] {
     ]
 }
 
+pub fn command_palette_items() -> &'static [&'static str] {
+    &[
+        "/help",
+        "/help all",
+        "/new",
+        "/i",
+        "/c ",
+        "/me @",
+        "/accept-key",
+        "/keys",
+        "/keys rotate",
+        "/keys refill",
+        "/keys revoke",
+        "/trust",
+        "/trust verify",
+        "/trust unverify",
+        "/trust list",
+        "/login",
+        "/login lookup ",
+        "/q",
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +381,14 @@ mod tests {
         assert!(help.contains("/keys rotate"));
         assert!(help.contains("/trust verify"));
         assert!(help.contains("/login set @name"));
+    }
+
+    #[test]
+    fn command_palette_includes_common_entries() {
+        let entries = command_palette_items();
+        assert!(entries.contains(&"/help"));
+        assert!(entries.contains(&"/c "));
+        assert!(entries.contains(&"/me @"));
+        assert!(entries.contains(&"/q"));
     }
 }
