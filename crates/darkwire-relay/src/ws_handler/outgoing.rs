@@ -321,6 +321,7 @@ mod tests {
 
         let envelope: serde_json::Value =
             serde_json::from_str(&raw).expect("encoded event must be valid JSON");
+        assert_eq!(envelope["pv"], 2);
         assert_eq!(envelope["t"], events::names::ERROR);
         assert_eq!(envelope["rid"], "req-1");
         assert_eq!(envelope["d"]["message"], "oops");

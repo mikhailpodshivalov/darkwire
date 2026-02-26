@@ -3,7 +3,7 @@ mod login;
 mod outgoing;
 mod parse;
 
-use crate::app_state::{ConnId, InviteCreateError, InviteUseError, MsgSendError, SharedState};
+use crate::app_state::{ConnId, InviteCreateError, InviteUseError, SharedState};
 use crate::logging;
 use axum::{
     extract::{
@@ -13,8 +13,8 @@ use axum::{
     response::IntoResponse,
 };
 use darkwire_protocol::events::{
-    self, ErrorCode, InviteCreateRequest, InviteUseRequest, MsgRecvEvent, MsgSendRequest,
-    RateLimitScope, SessionEndReason, SessionLeaveRequest, SessionStartedEvent,
+    self, ErrorCode, InviteCreateRequest, InviteUseRequest, RateLimitScope, SessionEndReason,
+    SessionLeaveRequest, SessionStartedEvent,
 };
 use std::{
     net::{IpAddr, SocketAddr},
@@ -193,6 +193,16 @@ async fn handle_text_message(
     };
 
     let request_id = incoming.request_id;
+    if requires_v2_protocol(&incoming.event_type) && incoming.protocol_version != Some(2) {
+        return send_error(
+            socket,
+            request_id,
+            ErrorCode::UnsupportedProtocol,
+            "unsupported protocol version for e2e event; expected pv=2",
+            conn_id,
+        )
+        .await;
+    }
 
     match incoming.event_type.as_str() {
         events::names::PING => send_pong(socket, request_id, conn_id).await,
@@ -386,80 +396,14 @@ async fn handle_text_message(
                 .await
         }
         events::names::MSG_SEND => {
-            let request: MsgSendRequest = match serde_json::from_value(incoming.data) {
-                Ok(request) => request,
-                Err(_) => {
-                    return send_error(
-                        socket,
-                        request_id,
-                        ErrorCode::BadRequest,
-                        "invalid msg.send payload",
-                        conn_id,
-                    )
-                    .await;
-                }
-            };
-
-            match state.route_message(conn_id, request.text.len()).await {
-                Ok(route) => {
-                    let payload = encode_event(
-                        events::names::MSG_RECV,
-                        None,
-                        MsgRecvEvent {
-                            session_id: route.session_id,
-                            text: request.text,
-                        },
-                    );
-
-                    if !state.send_to_connection(route.peer_conn, payload).await {
-                        if let Some(ended) = state
-                            .end_session_for_conn(conn_id, SessionEndReason::PeerDisconnect)
-                            .await
-                        {
-                            let _ = send_session_ended(
-                                socket,
-                                None,
-                                ended.session_id,
-                                SessionEndReason::PeerDisconnect,
-                                conn_id,
-                            )
-                            .await;
-                        }
-                    }
-
-                    true
-                }
-                Err(MsgSendError::NoActiveSession) => {
-                    send_error(
-                        socket,
-                        request_id,
-                        ErrorCode::NoActiveSession,
-                        "no active session",
-                        conn_id,
-                    )
-                    .await
-                }
-                Err(MsgSendError::MessageTooLarge) => {
-                    send_error(
-                        socket,
-                        request_id,
-                        ErrorCode::MessageTooLarge,
-                        "message exceeds max size",
-                        conn_id,
-                    )
-                    .await
-                }
-                Err(MsgSendError::RateLimited(retry_after)) => {
-                    send_rate_limited(
-                        socket,
-                        request_id,
-                        RateLimitScope::MsgSend,
-                        retry_after,
-                        conn_id,
-                    )
-                    .await
-                }
-            }
+            send_error(
+                socket,
+                request_id,
+                ErrorCode::E2eRequired,
+                "plaintext messaging disabled; use e2e.msg.send",
+                conn_id,
+            )
+            .await
         }
         events::names::SESSION_LEAVE => {
             let _: SessionLeaveRequest = match serde_json::from_value(incoming.data) {
@@ -519,4 +463,8 @@ async fn handle_text_message(
             .await
         }
     }
+}
+
+fn requires_v2_protocol(event_type: &str) -> bool {
+    event_type.starts_with("e2e.")
 }
