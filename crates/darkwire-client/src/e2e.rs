@@ -5,7 +5,7 @@ use ring::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
     digest::{digest, SHA256},
 };
-use std::{error::Error, fmt};
+use std::{collections::BTreeSet, error::Error, fmt};
 use uuid::Uuid;
 
 const PV_V2: u8 = 2;
@@ -15,6 +15,7 @@ const CHAIN_PUBLIC_CONTEXT: &[u8] = b"darkwire-e2e-chain-public-v1";
 const MESSAGE_KEY_CONTEXT: &[u8] = b"darkwire-e2e-msg-key-v1";
 const MESSAGE_NONCE_CONTEXT: &[u8] = b"darkwire-e2e-msg-nonce-v1";
 const MAX_FORWARD_GAP: u64 = 1024;
+const MAX_SKIPPED_RECV: usize = 2048;
 
 #[derive(Debug, Default)]
 pub struct SecureMessenger {
@@ -31,6 +32,7 @@ struct SecureMessagingSession {
     send_dh_x25519_b64u: String,
     send_n: u64,
     recv_n: u64,
+    skipped_recv: BTreeSet<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +58,7 @@ pub enum SecureMessagingError {
     InvalidUtf8,
     InvalidRootKey,
     CryptoInit,
+    SkippedWindowOverflow { limit: usize, pending: usize },
 }
 
 impl fmt::Display for SecureMessagingError {
@@ -78,6 +81,10 @@ impl fmt::Display for SecureMessagingError {
             SecureMessagingError::InvalidUtf8 => write!(f, "decrypted message is not utf-8"),
             SecureMessagingError::InvalidRootKey => write!(f, "invalid handshake root key"),
             SecureMessagingError::CryptoInit => write!(f, "failed to initialize cipher"),
+            SecureMessagingError::SkippedWindowOverflow { limit, pending } => write!(
+                f,
+                "skipped-message window overflow: limit={limit}, pending={pending}"
+            ),
         }
     }
 }
@@ -190,6 +197,11 @@ impl SecureMessenger {
 
         let expected = session.recv_n.saturating_add(1);
         if event.n < expected {
+            if session.skipped_recv.contains(&event.n) {
+                let message = decrypt_event_payload(session, event)?;
+                session.skipped_recv.remove(&event.n);
+                return Ok(message);
+            }
             return Err(SecureMessagingError::ReplayDetected(event.n));
         }
         if event.n.saturating_sub(expected) > MAX_FORWARD_GAP {
@@ -199,32 +211,8 @@ impl SecureMessenger {
             });
         }
 
-        let nonce =
-            decode_b64u_fixed_12(&event.nonce).map_err(|_| SecureMessagingError::InvalidNonce)?;
-        let expected_nonce = derive_nonce(&session.recv_key, event.n);
-        if nonce != expected_nonce {
-            return Err(SecureMessagingError::NonceMismatch);
-        }
-
-        let key_bytes = derive_32(MESSAGE_KEY_CONTEXT, &session.recv_key, Some(event.n));
-        let key = LessSafeKey::new(
-            UnboundKey::new(&aead::CHACHA20_POLY1305, &key_bytes)
-                .map_err(|_| SecureMessagingError::CryptoInit)?,
-        );
-        let mut ciphertext =
-            decode_b64u(&event.ct).map_err(|_| SecureMessagingError::DecryptFailed)?;
-        let aad = associated_data_bytes(&event.ad)
-            .map_err(|_| SecureMessagingError::InvalidAssociatedData)?;
-        let plaintext = key
-            .open_in_place(
-                Nonce::assume_unique_for_key(nonce),
-                Aad::from(aad.as_slice()),
-                &mut ciphertext,
-            )
-            .map_err(|_| SecureMessagingError::DecryptFailed)?;
-
-        let message =
-            String::from_utf8(plaintext.to_vec()).map_err(|_| SecureMessagingError::InvalidUtf8)?;
+        let message = decrypt_event_payload(session, event)?;
+        track_skipped_counters(session, expected, event.n)?;
         session.recv_n = event.n;
         Ok(message)
     }
@@ -257,10 +245,67 @@ impl SecureMessenger {
             send_dh_x25519_b64u,
             send_n,
             recv_n,
+            skipped_recv: BTreeSet::new(),
         });
 
         Ok(())
     }
+}
+
+fn decrypt_event_payload(
+    session: &SecureMessagingSession,
+    event: &E2eMsgRecvEvent,
+) -> Result<String, SecureMessagingError> {
+    let nonce =
+        decode_b64u_fixed_12(&event.nonce).map_err(|_| SecureMessagingError::InvalidNonce)?;
+    let expected_nonce = derive_nonce(&session.recv_key, event.n);
+    if nonce != expected_nonce {
+        return Err(SecureMessagingError::NonceMismatch);
+    }
+
+    let key_bytes = derive_32(MESSAGE_KEY_CONTEXT, &session.recv_key, Some(event.n));
+    let key = LessSafeKey::new(
+        UnboundKey::new(&aead::CHACHA20_POLY1305, &key_bytes)
+            .map_err(|_| SecureMessagingError::CryptoInit)?,
+    );
+    let mut ciphertext = decode_b64u(&event.ct).map_err(|_| SecureMessagingError::DecryptFailed)?;
+    let aad = associated_data_bytes(&event.ad)
+        .map_err(|_| SecureMessagingError::InvalidAssociatedData)?;
+    let plaintext = key
+        .open_in_place(
+            Nonce::assume_unique_for_key(nonce),
+            Aad::from(aad.as_slice()),
+            &mut ciphertext,
+        )
+        .map_err(|_| SecureMessagingError::DecryptFailed)?;
+
+    String::from_utf8(plaintext.to_vec()).map_err(|_| SecureMessagingError::InvalidUtf8)
+}
+
+fn track_skipped_counters(
+    session: &mut SecureMessagingSession,
+    expected: u64,
+    received: u64,
+) -> Result<(), SecureMessagingError> {
+    if received <= expected {
+        return Ok(());
+    }
+
+    let skipped = received.saturating_sub(expected) as usize;
+    let pending = session.skipped_recv.len();
+    let available = MAX_SKIPPED_RECV.saturating_sub(pending);
+    if skipped > available {
+        return Err(SecureMessagingError::SkippedWindowOverflow {
+            limit: MAX_SKIPPED_RECV,
+            pending,
+        });
+    }
+
+    for n in expected..received {
+        session.skipped_recv.insert(n);
+    }
+
+    Ok(())
 }
 
 fn associated_data_bytes(ad: &E2eMsgAd) -> Result<Vec<u8>, serde_json::Error> {
@@ -380,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_counter_gap_is_accepted() {
+    fn late_message_from_gap_is_accepted_once() {
         let init_material = material_for(HandshakeRole::Initiator);
         let mut resp_material = material_for(HandshakeRole::Responder);
         resp_material.session_id = init_material.session_id;
@@ -407,10 +452,60 @@ mod tests {
 
         let late_second = responder
             .decrypt_incoming(&second)
-            .expect_err("late m2 should be rejected after moving recv counter");
+            .expect("decrypt late m2");
+        assert_eq!(late_second, "m2");
+
+        let replay_late_second = responder
+            .decrypt_incoming(&second)
+            .expect_err("late m2 replay should be rejected");
         assert!(matches!(
-            late_second,
+            replay_late_second,
             SecureMessagingError::ReplayDetected(2)
+        ));
+    }
+
+    #[test]
+    fn skipped_window_overflow_is_rejected() {
+        let init_material = material_for(HandshakeRole::Initiator);
+        let mut resp_material = material_for(HandshakeRole::Responder);
+        resp_material.session_id = init_material.session_id;
+        resp_material.hs_id = init_material.hs_id;
+        resp_material.root_key_b64u = init_material.root_key_b64u.clone();
+
+        let mut initiator = SecureMessenger::default();
+        let mut responder = SecureMessenger::default();
+        initiator
+            .activate(&init_material)
+            .expect("activate initiator");
+        responder
+            .activate(&resp_material)
+            .expect("activate responder");
+
+        let mut selected = Vec::new();
+        for n in 1..=3075_u64 {
+            let event = initiator
+                .encrypt_outgoing(&format!("m{n}"))
+                .expect("encrypt message");
+            if n == 1025 || n == 2050 || n == 3075 {
+                selected.push(event);
+            }
+        }
+
+        let _ = responder
+            .decrypt_incoming(&selected[0])
+            .expect("decrypt 1025 should pass");
+        let _ = responder
+            .decrypt_incoming(&selected[1])
+            .expect("decrypt 2050 should pass");
+        let err = responder
+            .decrypt_incoming(&selected[2])
+            .expect_err("third wide gap should overflow skipped window");
+        assert!(matches!(
+            err,
+            SecureMessagingError::SkippedWindowOverflow {
+                limit: MAX_SKIPPED_RECV,
+                ..
+            }
         ));
     }
 
