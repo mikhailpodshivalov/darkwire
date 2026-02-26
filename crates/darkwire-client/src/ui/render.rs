@@ -246,7 +246,7 @@ impl TerminalUi {
         let _ = queue!(stdout, Print(" "));
         used += 1;
 
-        if line.sender.is_empty() {
+        if line.timestamp.is_empty() {
             let _ = queue!(stdout, Print(" ".repeat(sender_width)));
         } else {
             let sender = text::pad_or_trim(
@@ -277,18 +277,15 @@ impl TerminalUi {
         let _ = queue!(stdout, Print(": "));
         used += 2;
         let body = truncate_chars(&line.text, body_width);
-        match line.kind {
-            ChatLineKind::Error => {
-                let _ = queue!(
-                    stdout,
-                    SetForegroundColor(Color::Red),
-                    Print(&body),
-                    ResetColor
-                );
-            }
-            _ => {
-                let _ = queue!(stdout, Print(&body));
-            }
+        let body_color = match line.kind {
+            ChatLineKind::Error => Some(Color::Red),
+            ChatLineKind::System => style::sender_color(&line.sender).or(Some(Color::DarkGrey)),
+            ChatLineKind::Incoming | ChatLineKind::Outgoing => style::sender_color(&line.sender),
+        };
+        if let Some(color) = body_color {
+            let _ = queue!(stdout, SetForegroundColor(color), Print(&body), ResetColor);
+        } else {
+            let _ = queue!(stdout, Print(&body));
         }
         used += body.chars().count();
 
@@ -408,7 +405,7 @@ fn expanded_history_lines(
                 sender: if idx == 0 {
                     line.sender.clone()
                 } else {
-                    String::new()
+                    line.sender.clone()
                 },
                 text: chunk,
                 kind: line.kind,
@@ -467,6 +464,6 @@ mod tests {
         assert_eq!(expanded[0].timestamp, "12:00");
         assert_eq!(expanded[0].sender, "invite");
         assert!(expanded[1].timestamp.is_empty());
-        assert!(expanded[1].sender.is_empty());
+        assert_eq!(expanded[1].sender, "invite");
     }
 }
