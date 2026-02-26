@@ -725,10 +725,17 @@ impl ClientRuntime {
     }
 
     fn cached_login_for_peer(&self, peer_ik_ed25519: &str) -> Option<String> {
+        let local_login = self.local_login.as_deref();
         self.trust
             .login_for_peer(peer_ik_ed25519)
+            .filter(|login| Some(*login) != local_login)
             .map(str::to_string)
-            .or_else(|| self.known_peer_logins.get(peer_ik_ed25519).cloned())
+            .or_else(|| {
+                self.known_peer_logins
+                    .get(peer_ik_ed25519)
+                    .filter(|login| Some(login.as_str()) != local_login)
+                    .cloned()
+            })
     }
 
     fn copy_invite_or_print(&self, ui: &mut TerminalUi, invite: &str) {
