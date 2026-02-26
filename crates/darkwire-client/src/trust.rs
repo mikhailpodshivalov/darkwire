@@ -148,6 +148,7 @@ impl TrustManager {
         self.persist()
     }
 
+    #[allow(dead_code)]
     pub fn unverify_peer(&mut self, peer_ik_ed25519: &str) -> Result<(), Box<dyn Error>> {
         self.store.verified_peer_ik_ed25519.remove(peer_ik_ed25519);
         self.store.updated_unix = now_unix();

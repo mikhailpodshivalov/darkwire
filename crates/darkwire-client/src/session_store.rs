@@ -127,6 +127,7 @@ impl SessionStore {
         self.persist()
     }
 
+    #[allow(dead_code)]
     pub fn remove_peer(&mut self, peer_ik_ed25519: &str) -> Result<(), Box<dyn Error>> {
         if self
             .store
