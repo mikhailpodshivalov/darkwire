@@ -593,4 +593,63 @@ mod tests {
             .expect("decrypt after resume");
         assert_eq!(decrypted, "after-resume");
     }
+
+    #[test]
+    fn tampered_ciphertext_is_rejected_with_decrypt_failed() {
+        let init_material = material_for(HandshakeRole::Initiator);
+        let mut resp_material = material_for(HandshakeRole::Responder);
+        resp_material.session_id = init_material.session_id;
+        resp_material.hs_id = init_material.hs_id;
+        resp_material.root_key_b64u = init_material.root_key_b64u.clone();
+
+        let mut initiator = SecureMessenger::default();
+        let mut responder = SecureMessenger::default();
+        initiator
+            .activate(&init_material)
+            .expect("activate initiator");
+        responder
+            .activate(&resp_material)
+            .expect("activate responder");
+
+        let mut encrypted = initiator.encrypt_outgoing("hello").expect("encrypt");
+        let mut ct_bytes = decode_b64u(&encrypted.ct).expect("ciphertext should decode");
+        let last = ct_bytes
+            .last_mut()
+            .expect("encrypted payload must contain at least tag bytes");
+        *last ^= 0x01;
+        encrypted.ct = encode_b64u(&ct_bytes);
+
+        let err = responder
+            .decrypt_incoming(&encrypted)
+            .expect_err("tampered ciphertext must fail");
+        assert!(matches!(err, SecureMessagingError::DecryptFailed));
+    }
+
+    #[test]
+    fn tampered_nonce_is_rejected_with_nonce_mismatch() {
+        let init_material = material_for(HandshakeRole::Initiator);
+        let mut resp_material = material_for(HandshakeRole::Responder);
+        resp_material.session_id = init_material.session_id;
+        resp_material.hs_id = init_material.hs_id;
+        resp_material.root_key_b64u = init_material.root_key_b64u.clone();
+
+        let mut initiator = SecureMessenger::default();
+        let mut responder = SecureMessenger::default();
+        initiator
+            .activate(&init_material)
+            .expect("activate initiator");
+        responder
+            .activate(&resp_material)
+            .expect("activate responder");
+
+        let mut encrypted = initiator.encrypt_outgoing("hello").expect("encrypt");
+        let mut nonce_bytes = decode_b64u(&encrypted.nonce).expect("nonce should decode");
+        nonce_bytes[0] ^= 0x01;
+        encrypted.nonce = encode_b64u(&nonce_bytes);
+
+        let err = responder
+            .decrypt_incoming(&encrypted)
+            .expect_err("tampered nonce must fail");
+        assert!(matches!(err, SecureMessagingError::NonceMismatch));
+    }
 }

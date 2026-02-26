@@ -255,7 +255,7 @@ pub(super) async fn handle_handshake_init(
             send_error(
                 socket,
                 request_id,
-                ErrorCode::BadRequest,
+                ErrorCode::HandshakeInvalid,
                 "invalid e2e.handshake.init payload",
                 conn_id,
             )
@@ -405,7 +405,7 @@ pub(super) async fn handle_handshake_accept(
             send_error(
                 socket,
                 request_id,
-                ErrorCode::BadRequest,
+                ErrorCode::HandshakeInvalid,
                 "invalid e2e.handshake.accept payload",
                 conn_id,
             )

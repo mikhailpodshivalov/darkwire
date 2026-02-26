@@ -852,6 +852,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integration_handshake_init_invalid_payload_returns_handshake_invalid() {
+        let (addr, shutdown_tx, server_task) = spawn_test_relay(LimitsConfig::default()).await;
+        let mut client = connect_client(addr).await;
+        assert_eq!(
+            recv_with_timeout(&mut client).await.event_type,
+            events::names::READY
+        );
+
+        send_event(
+            &mut client,
+            events::names::E2E_HANDSHAKE_INIT,
+            "req-hs-init-invalid",
+            HandshakeInitRequest {
+                session_id: Uuid::new_v4(),
+                hs_id: Uuid::new_v4(),
+                sender_ik_ed25519: "sender_ik".to_string(),
+                sender_eph_x25519: "sender_eph".to_string(),
+                peer_spk_id: 1,
+                peer_opk_id: None,
+                sig_ed25519: "sender_sig".to_string(),
+                ts_unix: 0,
+            },
+        )
+        .await;
+
+        let envelope = recv_until(&mut client, events::names::ERROR).await;
+        assert_eq!(envelope.request_id.as_deref(), Some("req-hs-init-invalid"));
+        let payload = serde_json::from_value::<ErrorEvent>(envelope.data)
+            .expect("error payload should parse");
+        assert_eq!(payload.code, ErrorCode::HandshakeInvalid);
+
+        let _ = shutdown_tx.send(());
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn integration_handshake_accept_invalid_payload_returns_handshake_invalid() {
+        let (addr, shutdown_tx, server_task) = spawn_test_relay(LimitsConfig::default()).await;
+        let mut client = connect_client(addr).await;
+        assert_eq!(
+            recv_with_timeout(&mut client).await.event_type,
+            events::names::READY
+        );
+
+        send_event(
+            &mut client,
+            events::names::E2E_HANDSHAKE_ACCEPT,
+            "req-hs-accept-invalid",
+            HandshakeAcceptRequest {
+                session_id: Uuid::new_v4(),
+                hs_id: Uuid::new_v4(),
+                responder_ik_ed25519: "responder_ik".to_string(),
+                responder_eph_x25519: "responder_eph".to_string(),
+                sig_ed25519: "responder_sig".to_string(),
+                kc: String::new(),
+            },
+        )
+        .await;
+
+        let envelope = recv_until(&mut client, events::names::ERROR).await;
+        assert_eq!(
+            envelope.request_id.as_deref(),
+            Some("req-hs-accept-invalid")
+        );
+        let payload = serde_json::from_value::<ErrorEvent>(envelope.data)
+            .expect("error payload should parse");
+        assert_eq!(payload.code, ErrorCode::HandshakeInvalid);
+
+        let _ = shutdown_tx.send(());
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
     async fn integration_login_bind_lookup_and_hijack_rejection() {
         let (addr, shutdown_tx, server_task) = spawn_test_relay(LimitsConfig::default()).await;
 
