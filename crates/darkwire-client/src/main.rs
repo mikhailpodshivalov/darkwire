@@ -10,7 +10,7 @@ mod ui;
 mod wire;
 
 use clap::Parser;
-use config::{resolve_invite_relay, ClientArgs};
+use config::{load_dotenv, resolve_invite_relay, ClientArgs};
 use crossterm::event::{Event, EventStream};
 use darkwire_protocol::events::Envelope;
 use futures_util::{SinkExt, StreamExt};
@@ -34,6 +34,7 @@ pub(crate) use runtime::WsWriter;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider();
+    load_dotenv();
 
     let args = ClientArgs::parse();
     let relay_ws = args.relay.clone();
