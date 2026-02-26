@@ -41,6 +41,7 @@ pub(super) struct ChatLine {
 pub struct TerminalUi {
     interactive: bool,
     theme: style::UiTheme,
+    show_details: bool,
     input_buffer: String,
     command_matches: Vec<&'static str>,
     command_selected: usize,
@@ -53,6 +54,7 @@ impl TerminalUi {
         Self {
             interactive,
             theme: style::UiTheme::default(),
+            show_details: false,
             input_buffer: String::new(),
             command_matches: Vec::new(),
             command_selected: 0,
@@ -61,10 +63,20 @@ impl TerminalUi {
         }
     }
 
+    pub fn toggle_details(&mut self) -> bool {
+        self.show_details = !self.show_details;
+        if self.interactive {
+            self.render();
+        }
+        self.show_details
+    }
+
     pub fn print_line(&mut self, line: &str) {
         if self.interactive {
             self.track_context_from_line(line);
-            self.push_history_line(line, false);
+            if let Some(display_line) = display_line_for_mode(line, false, self.show_details) {
+                self.push_history_line(&display_line, false);
+            }
             self.render();
             return;
         }
@@ -75,7 +87,9 @@ impl TerminalUi {
     pub fn print_error(&mut self, line: &str) {
         if self.interactive {
             self.track_context_from_line(line);
-            self.push_history_line(line, true);
+            if let Some(display_line) = display_line_for_mode(line, true, self.show_details) {
+                self.push_history_line(&display_line, true);
+            }
             self.render();
             return;
         }
@@ -301,6 +315,91 @@ impl TerminalUi {
     }
 }
 
+fn display_line_for_mode(line: &str, is_error: bool, show_details: bool) -> Option<String> {
+    if is_error || show_details {
+        return Some(line.to_string());
+    }
+
+    let Some((sender, payload)) = line_parse::parse_bracketed_system_line(line) else {
+        return Some(line.to_string());
+    };
+
+    match sender.as_str() {
+        "ready" | "keys" | "resume" => None,
+        "invite" => sanitize_invite_line(&payload),
+        "session" => Some(sanitize_session_line(&payload)),
+        "e2e" => sanitize_e2e_line(&payload),
+        "trust" => sanitize_trust_line(&payload),
+        "login" => Some(sanitize_login_line(&payload)),
+        _ => Some(line.to_string()),
+    }
+}
+
+fn sanitize_invite_line(payload: &str) -> Option<String> {
+    if payload.starts_with("DL1:") {
+        return Some("[invite] new invite ready (use /my invite copy)".to_string());
+    }
+
+    if payload.is_empty() {
+        return None;
+    }
+
+    Some(format!("[invite] {payload}"))
+}
+
+fn sanitize_session_line(payload: &str) -> String {
+    if payload.starts_with("started id=") {
+        return "[session] started".to_string();
+    }
+
+    if payload.starts_with("ended reason=") {
+        return format!("[session] {payload}");
+    }
+
+    format!("[session] {payload}")
+}
+
+fn sanitize_e2e_line(payload: &str) -> Option<String> {
+    if payload.starts_with("secure session established") {
+        return Some("[e2e] secure session established".to_string());
+    }
+
+    if payload.starts_with("secure session resumed") {
+        return Some("[e2e] secure session resumed".to_string());
+    }
+
+    if payload.starts_with("resume unavailable, requesting prekey bundle for recovery") {
+        return Some("[e2e] attempting secure recovery".to_string());
+    }
+
+    None
+}
+
+fn sanitize_trust_line(payload: &str) -> Option<String> {
+    if payload.starts_with("verified_contacts=") {
+        return None;
+    }
+
+    if let Some(rest) = payload.strip_prefix("state=") {
+        let state = rest.split_whitespace().next().unwrap_or("unknown");
+        return Some(format!("[trust] state={state}"));
+    }
+
+    if payload.is_empty() {
+        return None;
+    }
+
+    Some(format!("[trust] {payload}"))
+}
+
+fn sanitize_login_line(payload: &str) -> String {
+    if let Some((prefix, _)) = payload.split_once(" fp=") {
+        return format!("[login] {prefix}");
+    }
+
+    format!("[login] {payload}")
+}
+
 fn normalize_peer_display_name(sender: &str) -> String {
     let trimmed = sender.trim();
     if trimmed.starts_with("fp:") {
@@ -438,5 +537,58 @@ mod tests {
     fn normalize_peer_display_name_hides_fingerprint_label() {
         assert_eq!(normalize_peer_display_name("fp:123456"), "peer");
         assert_eq!(normalize_peer_display_name("@mike"), "@mike");
+    }
+
+    #[test]
+    fn clean_mode_hides_noisy_system_lines() {
+        assert_eq!(
+            display_line_for_mode("[ready:cli-1] server_time=1", false, false),
+            None
+        );
+        assert_eq!(
+            display_line_for_mode("[keys:cli-2] published spk_id=1 opk_count=64", false, false),
+            None
+        );
+        assert_eq!(
+            display_line_for_mode("[e2e:cli-3] handshake.init.recv session_id=1", false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn clean_mode_keeps_important_events_with_compact_text() {
+        assert_eq!(
+            display_line_for_mode(
+                "[e2e] secure session established role=initiator session=abc",
+                false,
+                false
+            )
+            .as_deref(),
+            Some("[e2e] secure session established")
+        );
+        assert_eq!(
+            display_line_for_mode("[session:cli-4] started id=abc", false, false).as_deref(),
+            Some("[session] started")
+        );
+        assert_eq!(
+            display_line_for_mode("[invite:cli-5] DL1:abc.def", false, false).as_deref(),
+            Some("[invite] new invite ready (use /my invite copy)")
+        );
+    }
+
+    #[test]
+    fn details_mode_preserves_original_lines() {
+        let line = "[e2e:cli-4] handshake.init.recv session_id=1";
+        assert_eq!(
+            display_line_for_mode(line, false, true).as_deref(),
+            Some(line)
+        );
+    }
+
+    #[test]
+    fn toggle_details_flips_state() {
+        let mut ui = TerminalUi::new(false);
+        assert!(ui.toggle_details());
+        assert!(!ui.toggle_details());
     }
 }

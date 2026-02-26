@@ -61,14 +61,17 @@ Then use the same flow:
 
 ## Commands (Current Minimal Set)
 
+Default UI mode is `clean` (reduced system noise). Use `/details` (or `+`) to show full technical events.
+
 1. `/help` - show command list
 2. `/my invite copy` - create invite and copy it to clipboard
 3. `/invite CODE` - join by invite code
 4. `/login @name` - set or change your username
 5. `/trust` - show trust state and safety number of active peer
 6. `/accept-key` - accept peer key change and continue
-7. `/q` - quit
-8. `<text>` - send encrypted message in active secure session
+7. `/details` (or `+`) - toggle verbose system diagnostics on/off
+8. `/q` - quit
+9. `<text>` - send encrypted message in active secure session
 
 ## Security Notes (Practical)
 

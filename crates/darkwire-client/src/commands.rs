@@ -6,6 +6,7 @@ pub enum UserCommand {
     SetUsername(String),
     AcceptKey,
     TrustStatus,
+    ToggleDetails,
     Quit,
     SendMessage(String),
     Ignore,
@@ -56,6 +57,10 @@ pub fn parse_user_command(line: &str) -> UserCommand {
         return UserCommand::TrustStatus;
     }
 
+    if trimmed == "/details" || trimmed == "+" {
+        return UserCommand::ToggleDetails;
+    }
+
     if trimmed == "/accept-key" {
         return UserCommand::AcceptKey;
     }
@@ -79,6 +84,7 @@ pub fn command_help_basic_lines() -> &'static [&'static str] {
         "/login @name - set or change your username",
         "/accept-key - accept peer key change and continue",
         "/trust - show active peer trust status",
+        "/details (+) - toggle verbose system diagnostics",
         "/q - quit",
         "<text> - send encrypted message in active secure session",
     ]
@@ -96,6 +102,7 @@ pub fn command_palette_items() -> &'static [&'static str] {
         "/login @",
         "/trust",
         "/accept-key",
+        "/details",
         "/q",
     ]
 }
@@ -149,6 +156,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_command_toggle_details() {
+        assert_eq!(parse_user_command("/details"), UserCommand::ToggleDetails);
+        assert_eq!(parse_user_command("+"), UserCommand::ToggleDetails);
+    }
+
+    #[test]
     fn parse_command_message() {
         assert_eq!(
             parse_user_command("hello"),
@@ -195,6 +208,7 @@ mod tests {
         assert!(help.contains("/login @name"));
         assert!(help.contains("/trust"));
         assert!(help.contains("/accept-key"));
+        assert!(help.contains("/details (+)"));
         assert!(help.contains("/q"));
         assert!(!help.contains("/keys rotate"));
         assert!(!help.contains("/trust verify"));
@@ -218,6 +232,7 @@ mod tests {
                 "/login @",
                 "/trust",
                 "/accept-key",
+                "/details",
                 "/q",
             ]
         );
