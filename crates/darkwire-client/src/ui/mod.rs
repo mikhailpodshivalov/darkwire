@@ -4,6 +4,7 @@ mod style;
 mod text;
 
 use crate::commands::command_palette_items;
+use base64::{engine::general_purpose::STANDARD as BASE64_STD, Engine as _};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -96,6 +97,18 @@ impl TerminalUi {
         }
 
         let _ = clear_screen_and_show_cursor();
+    }
+
+    pub fn copy_to_clipboard(&mut self, text: &str) -> io::Result<()> {
+        let encoded = BASE64_STD.encode(text.as_bytes());
+        let mut stdout = io::stdout();
+        // OSC52 clipboard escape (best-effort, supported by most modern terminals).
+        write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+        stdout.flush()?;
+        if self.interactive {
+            self.render();
+        }
+        Ok(())
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Option<String> {

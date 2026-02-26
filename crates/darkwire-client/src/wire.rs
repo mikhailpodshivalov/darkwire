@@ -16,6 +16,10 @@ pub struct ClientState {
 
 #[derive(Debug, Clone)]
 pub enum WireAction {
+    InviteCreated {
+        request_id: Option<String>,
+        invite: String,
+    },
     SessionStarted {
         session_id: Uuid,
     },
@@ -52,6 +56,14 @@ pub fn extract_wire_action(raw: &str) -> Option<WireAction> {
     let envelope: IncomingEnvelope = serde_json::from_str(raw).ok()?;
     let request_id = envelope.request_id.clone();
     match envelope.event_type.as_str() {
+        events::names::INVITE_CREATED => {
+            serde_json::from_value::<InviteCreatedEvent>(envelope.data)
+                .ok()
+                .map(|event| WireAction::InviteCreated {
+                    request_id,
+                    invite: event.invite,
+                })
+        }
         events::names::SESSION_STARTED => {
             serde_json::from_value::<SessionStartedEvent>(envelope.data)
                 .ok()
@@ -248,7 +260,9 @@ fn rate_limit_scope_name(scope: darkwire_protocol::events::RateLimitScope) -> &'
 #[cfg(test)]
 mod tests {
     use super::*;
-    use darkwire_protocol::events::{Envelope, ErrorEvent, LoginBindingEvent, SessionStartedEvent};
+    use darkwire_protocol::events::{
+        Envelope, ErrorEvent, InviteCreatedEvent, LoginBindingEvent, SessionStartedEvent,
+    };
 
     #[test]
     fn session_started_with_request_id_marks_local_initiator() {
@@ -267,6 +281,29 @@ mod tests {
 
         let _ = handle_server_text(&raw, &mut state);
         assert!(state.should_initiate_handshake);
+    }
+
+    #[test]
+    fn extract_wire_action_invite_created_contains_invite_code() {
+        let raw = serde_json::to_string(
+            &Envelope::new(
+                events::names::INVITE_CREATED,
+                InviteCreatedEvent {
+                    invite: "DL1:abc.def".to_string(),
+                    expires_in: 600,
+                },
+            )
+            .with_request_id("cli-9".to_string()),
+        )
+        .expect("serialize");
+
+        match extract_wire_action(&raw) {
+            Some(WireAction::InviteCreated { request_id, invite }) => {
+                assert_eq!(request_id.as_deref(), Some("cli-9"));
+                assert_eq!(invite, "DL1:abc.def");
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
     }
 
     #[test]

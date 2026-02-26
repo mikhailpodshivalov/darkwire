@@ -3,6 +3,8 @@ pub enum UserCommand {
     Help,
     HelpAll,
     CreateInvite,
+    CreateInviteAndCopy,
+    CopyLastInvite,
     ConnectInvite(String),
     SetUsername(String),
     AcceptKey,
@@ -46,6 +48,14 @@ pub fn parse_user_command(line: &str) -> UserCommand {
 
     if trimmed == "/new" || trimmed == "/i" {
         return UserCommand::CreateInvite;
+    }
+
+    if trimmed == "/new copy" || trimmed == "/i copy" {
+        return UserCommand::CreateInviteAndCopy;
+    }
+
+    if trimmed == "/copy" || trimmed == "/copy invite" {
+        return UserCommand::CopyLastInvite;
     }
 
     if trimmed == "/q" {
@@ -157,6 +167,8 @@ pub fn command_help_basic_lines() -> &'static [&'static str] {
         "/help - show basic help",
         "/help all - show full command list",
         "/new (/i) - create new invite",
+        "/new copy - create invite and copy to clipboard",
+        "/copy - copy latest invite to clipboard",
         "/c CODE - connect by invite code",
         "/me @name - set or change your username",
         "/accept-key - accept peer key change and continue",
@@ -170,6 +182,8 @@ pub fn command_help_all_lines() -> &'static [&'static str] {
         "/help - show basic help",
         "/help all - show full command list",
         "/new (/i) - create new invite",
+        "/new copy - create invite and copy to clipboard",
+        "/copy - copy latest invite to clipboard",
         "/c CODE - connect by invite code",
         "/me @name - set or change your username",
         "/accept-key - accept peer key change and continue",
@@ -194,8 +208,10 @@ pub fn command_palette_items() -> &'static [&'static str] {
         "/help",
         "/help all",
         "/new",
+        "/new copy",
         "/i",
         "/c ",
+        "/copy",
         "/me @",
         "/accept-key",
         "/keys",
@@ -222,6 +238,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_command_invite_create_and_copy() {
+        assert_eq!(
+            parse_user_command("/new copy"),
+            UserCommand::CreateInviteAndCopy
+        );
+    }
+
+    #[test]
     fn parse_command_help() {
         assert_eq!(parse_user_command("/help"), UserCommand::Help);
     }
@@ -234,6 +258,23 @@ mod tests {
     #[test]
     fn parse_command_invite_create_legacy_alias() {
         assert_eq!(parse_user_command("/i"), UserCommand::CreateInvite);
+    }
+
+    #[test]
+    fn parse_command_invite_create_and_copy_legacy_alias() {
+        assert_eq!(
+            parse_user_command("/i copy"),
+            UserCommand::CreateInviteAndCopy
+        );
+    }
+
+    #[test]
+    fn parse_command_copy_last_invite() {
+        assert_eq!(parse_user_command("/copy"), UserCommand::CopyLastInvite);
+        assert_eq!(
+            parse_user_command("/copy invite"),
+            UserCommand::CopyLastInvite
+        );
     }
 
     #[test]
