@@ -14,8 +14,10 @@ const DIR_RESPONDER_TO_INITIATOR: &[u8] = b"darkwire-e2e-dir-resp->init-v1";
 const CHAIN_PUBLIC_CONTEXT: &[u8] = b"darkwire-e2e-chain-public-v1";
 const MESSAGE_KEY_CONTEXT: &[u8] = b"darkwire-e2e-msg-key-v1";
 const MESSAGE_NONCE_CONTEXT: &[u8] = b"darkwire-e2e-msg-nonce-v1";
-const MAX_FORWARD_GAP: u64 = 1024;
-const MAX_SKIPPED_RECV: usize = 2048;
+const DEFAULT_RELIABILITY_POLICY: ReliabilityPolicy = ReliabilityPolicy {
+    max_forward_gap: 1024,
+    max_skipped_recv: 2048,
+};
 
 #[derive(Debug, Default)]
 pub struct SecureMessenger {
@@ -32,7 +34,7 @@ struct SecureMessagingSession {
     send_dh_x25519_b64u: String,
     send_n: u64,
     recv_n: u64,
-    skipped_recv: BTreeSet<u64>,
+    skipped_recv: SkippedCounterWindow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +92,54 @@ impl fmt::Display for SecureMessagingError {
 }
 
 impl Error for SecureMessagingError {}
+
+#[derive(Debug, Clone, Copy)]
+struct ReliabilityPolicy {
+    max_forward_gap: u64,
+    max_skipped_recv: usize,
+}
+
+#[derive(Debug, Default)]
+struct SkippedCounterWindow {
+    pending: BTreeSet<u64>,
+}
+
+impl SkippedCounterWindow {
+    fn contains(&self, counter: u64) -> bool {
+        self.pending.contains(&counter)
+    }
+
+    fn remove(&mut self, counter: u64) {
+        self.pending.remove(&counter);
+    }
+
+    fn track_gap(
+        &mut self,
+        expected: u64,
+        received: u64,
+        policy: ReliabilityPolicy,
+    ) -> Result<(), SecureMessagingError> {
+        if received <= expected {
+            return Ok(());
+        }
+
+        let skipped = received.saturating_sub(expected) as usize;
+        let pending = self.pending.len();
+        let available = policy.max_skipped_recv.saturating_sub(pending);
+        if skipped > available {
+            return Err(SecureMessagingError::SkippedWindowOverflow {
+                limit: policy.max_skipped_recv,
+                pending,
+            });
+        }
+
+        for n in expected..received {
+            self.pending.insert(n);
+        }
+
+        Ok(())
+    }
+}
 
 impl SecureMessenger {
     pub fn clear(&mut self) {
@@ -197,14 +247,14 @@ impl SecureMessenger {
 
         let expected = session.recv_n.saturating_add(1);
         if event.n < expected {
-            if session.skipped_recv.contains(&event.n) {
+            if session.skipped_recv.contains(event.n) {
                 let message = decrypt_event_payload(session, event)?;
-                session.skipped_recv.remove(&event.n);
+                session.skipped_recv.remove(event.n);
                 return Ok(message);
             }
             return Err(SecureMessagingError::ReplayDetected(event.n));
         }
-        if event.n.saturating_sub(expected) > MAX_FORWARD_GAP {
+        if event.n.saturating_sub(expected) > DEFAULT_RELIABILITY_POLICY.max_forward_gap {
             return Err(SecureMessagingError::OutOfOrder {
                 expected,
                 got: event.n,
@@ -212,7 +262,9 @@ impl SecureMessenger {
         }
 
         let message = decrypt_event_payload(session, event)?;
-        track_skipped_counters(session, expected, event.n)?;
+        session
+            .skipped_recv
+            .track_gap(expected, event.n, DEFAULT_RELIABILITY_POLICY)?;
         session.recv_n = event.n;
         Ok(message)
     }
@@ -245,7 +297,7 @@ impl SecureMessenger {
             send_dh_x25519_b64u,
             send_n,
             recv_n,
-            skipped_recv: BTreeSet::new(),
+            skipped_recv: SkippedCounterWindow::default(),
         });
 
         Ok(())
@@ -280,32 +332,6 @@ fn decrypt_event_payload(
         .map_err(|_| SecureMessagingError::DecryptFailed)?;
 
     String::from_utf8(plaintext.to_vec()).map_err(|_| SecureMessagingError::InvalidUtf8)
-}
-
-fn track_skipped_counters(
-    session: &mut SecureMessagingSession,
-    expected: u64,
-    received: u64,
-) -> Result<(), SecureMessagingError> {
-    if received <= expected {
-        return Ok(());
-    }
-
-    let skipped = received.saturating_sub(expected) as usize;
-    let pending = session.skipped_recv.len();
-    let available = MAX_SKIPPED_RECV.saturating_sub(pending);
-    if skipped > available {
-        return Err(SecureMessagingError::SkippedWindowOverflow {
-            limit: MAX_SKIPPED_RECV,
-            pending,
-        });
-    }
-
-    for n in expected..received {
-        session.skipped_recv.insert(n);
-    }
-
-    Ok(())
 }
 
 fn associated_data_bytes(ad: &E2eMsgAd) -> Result<Vec<u8>, serde_json::Error> {
@@ -500,13 +526,12 @@ mod tests {
         let err = responder
             .decrypt_incoming(&selected[2])
             .expect_err("third wide gap should overflow skipped window");
-        assert!(matches!(
-            err,
-            SecureMessagingError::SkippedWindowOverflow {
-                limit: MAX_SKIPPED_RECV,
-                ..
+        match err {
+            SecureMessagingError::SkippedWindowOverflow { limit, .. } => {
+                assert_eq!(limit, DEFAULT_RELIABILITY_POLICY.max_skipped_recv);
             }
-        ));
+            other => panic!("unexpected error variant: {other}"),
+        }
     }
 
     #[test]
