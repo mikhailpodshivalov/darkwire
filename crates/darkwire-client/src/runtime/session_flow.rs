@@ -235,6 +235,7 @@ pub(super) fn reset_secure_runtime_state(
     if clear_pending_resume_peer {
         runtime.pending_resume_peer_ik = None;
     }
+    runtime.clear_outbound_delivery_state();
 }
 
 pub(super) async fn on_handshake_tick(
