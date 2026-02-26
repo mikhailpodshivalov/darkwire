@@ -10,7 +10,7 @@ use crate::{
 };
 use darkwire_protocol::events::{
     self, E2eMsgRecvEvent, Envelope, ErrorCode, ErrorEvent, InviteCreateRequest, InviteUseRequest,
-    LoginBindRequest, LoginLookupRequest, SessionLeaveRequest,
+    LoginBindRequest, LoginLookupRequest, PrekeyGetRequest, SessionLeaveRequest,
 };
 use darkwire_protocol::invite::decode_invite;
 use darkwire_protocol::login::{format_login, normalize_login};
@@ -36,6 +36,7 @@ pub struct ClientRuntime {
     active_peer_trust: Option<ActivePeerTrust>,
     active_peer_login: Option<String>,
     pending_resume_peer_ik: Option<String>,
+    resume_recovery_requested: bool,
     local_login: Option<String>,
     pending_local_login_lookup: HashSet<String>,
     pending_peer_login_lookup: HashSet<String>,
@@ -55,6 +56,7 @@ impl ClientRuntime {
             active_peer_trust: None,
             active_peer_login: None,
             pending_resume_peer_ik: None,
+            resume_recovery_requested: false,
             local_login: None,
             pending_local_login_lookup: HashSet::new(),
             pending_peer_login_lookup: HashSet::new(),
@@ -162,6 +164,7 @@ impl ClientRuntime {
                 self.session_store
                     .reset_for_local_identity(keys.identity_public_ed25519())?;
                 self.pending_resume_peer_ik = None;
+                self.resume_recovery_requested = false;
                 self.publish_prekeys(ws_writer, keys).await?;
                 if self.state.active_session {
                     self.abort_handshake_session(ws_writer).await?;
@@ -349,6 +352,7 @@ impl ClientRuntime {
                 self.secure_messenger.clear();
                 self.active_peer_trust = None;
                 self.active_peer_login = None;
+                self.resume_recovery_requested = false;
                 self.bootstrap.clear();
 
                 let resumed = self
@@ -374,6 +378,7 @@ impl ClientRuntime {
                 self.active_peer_trust = None;
                 self.active_peer_login = None;
                 self.pending_resume_peer_ik = None;
+                self.resume_recovery_requested = false;
 
                 handle_wire_action(
                     WireAction::SessionEnded,
@@ -397,6 +402,12 @@ impl ClientRuntime {
                         self.persist_active_session_checkpoint()?;
                         return Ok(());
                     }
+
+                    self.maybe_request_recovery_handshake(ws_writer, ui).await?;
+                    ui.print_error(
+                        "[e2e] secure session unavailable; waiting for recovery handshake",
+                    );
+                    return Ok(());
                 }
 
                 match self.secure_messenger.decrypt_incoming(&event) {
@@ -435,6 +446,7 @@ impl ClientRuntime {
                         self.state.secure_active = false;
                     } else {
                         let trust = self.trust.evaluate_peer(&material.peer_ik_ed25519)?;
+                        self.resume_recovery_requested = false;
                         self.active_peer_login = None;
                         self.print_active_trust(ui, &trust);
 
@@ -503,6 +515,7 @@ impl ClientRuntime {
         self.secure_messenger.clear();
         self.active_peer_trust = None;
         self.active_peer_login = None;
+        self.resume_recovery_requested = false;
         Ok(())
     }
 
@@ -645,6 +658,7 @@ impl ClientRuntime {
 
         self.secure_messenger = resumed;
         self.state.secure_active = true;
+        self.resume_recovery_requested = false;
 
         let trust = self.trust.evaluate_peer(&peer_ik_ed25519)?;
         self.active_peer_login = None;
@@ -709,6 +723,7 @@ impl ClientRuntime {
 
             self.secure_messenger = resumed;
             self.state.secure_active = true;
+            self.resume_recovery_requested = false;
             self.active_peer_login = None;
             self.active_peer_trust = Some(trust.clone());
             self.print_active_trust(ui, &trust);
@@ -757,6 +772,31 @@ impl ClientRuntime {
                 now,
             ),
         }
+    }
+
+    async fn maybe_request_recovery_handshake(
+        &mut self,
+        ws_writer: &mut WsWriter,
+        ui: &mut TerminalUi,
+    ) -> Result<(), Box<dyn Error>> {
+        if !should_request_recovery_handshake(&self.state, self.resume_recovery_requested) {
+            return Ok(());
+        }
+
+        let Some(session_id) = self.state.active_session_id else {
+            return Ok(());
+        };
+
+        let _ = self
+            .send_request(
+                ws_writer,
+                events::names::E2E_PREKEY_GET,
+                PrekeyGetRequest { session_id },
+            )
+            .await?;
+        self.resume_recovery_requested = true;
+        ui.print_line("[e2e] resume unavailable, requesting prekey bundle for recovery");
+        Ok(())
     }
 
     fn verify_or_accept_active_peer(
@@ -969,5 +1009,54 @@ impl ClientRuntime {
         ui.print_error(&format!(
             "[trust] WARNING: peer identity key changed (prev_fp={previous_fingerprint} new_fp={new_fingerprint}); use /accept-key to continue",
         ));
+    }
+}
+
+fn should_request_recovery_handshake(state: &ClientState, recovery_requested: bool) -> bool {
+    state.active_session
+        && !state.secure_active
+        && state.active_session_id.is_some()
+        && !recovery_requested
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn recovery_request_predicate_true_for_unsecured_active_session() {
+        let state = ClientState {
+            active_session: true,
+            active_session_id: Some(Uuid::new_v4()),
+            secure_active: false,
+            should_initiate_handshake: false,
+        };
+
+        assert!(should_request_recovery_handshake(&state, false));
+    }
+
+    #[test]
+    fn recovery_request_predicate_false_when_already_requested() {
+        let state = ClientState {
+            active_session: true,
+            active_session_id: Some(Uuid::new_v4()),
+            secure_active: false,
+            should_initiate_handshake: false,
+        };
+
+        assert!(!should_request_recovery_handshake(&state, true));
+    }
+
+    #[test]
+    fn recovery_request_predicate_false_when_secure_is_active() {
+        let state = ClientState {
+            active_session: true,
+            active_session_id: Some(Uuid::new_v4()),
+            secure_active: true,
+            should_initiate_handshake: false,
+        };
+
+        assert!(!should_request_recovery_handshake(&state, false));
     }
 }
