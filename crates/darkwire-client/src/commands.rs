@@ -90,10 +90,6 @@ pub fn command_help_basic_lines() -> &'static [&'static str] {
     ]
 }
 
-pub fn command_help_all_lines() -> &'static [&'static str] {
-    command_help_basic_lines()
-}
-
 pub fn command_palette_items() -> &'static [&'static str] {
     &[
         "/help",
@@ -213,11 +209,6 @@ mod tests {
         assert!(!help.contains("/keys rotate"));
         assert!(!help.contains("/trust verify"));
         assert!(!help.contains("/help all"));
-    }
-
-    #[test]
-    fn all_help_lines_are_same_as_basic() {
-        assert_eq!(command_help_all_lines(), command_help_basic_lines());
     }
 
     #[test]
