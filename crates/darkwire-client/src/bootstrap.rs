@@ -205,6 +205,7 @@ pub async fn handle_wire_action(
         | WireAction::InviteCreated { .. }
         | WireAction::LoginBound { .. }
         | WireAction::LoginBinding { .. }
+        | WireAction::RateLimited { .. }
         | WireAction::Error { .. } => {}
     }
 

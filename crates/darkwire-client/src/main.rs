@@ -62,6 +62,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut key_events = EventStream::new();
     let mut handshake_tick = time::interval(Duration::from_secs(1));
     handshake_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut outbox_tick = time::interval(Duration::from_millis(50));
+    outbox_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let trust_file = default_trust_file_path(keys.key_file());
     let trust = TrustManager::load_or_init(trust_file)?;
@@ -159,6 +161,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             _ = handshake_tick.tick() => {
                 runtime.on_handshake_tick(&mut ws_writer, &mut ui).await?;
+            }
+            _ = outbox_tick.tick() => {
+                runtime.on_outbox_tick(&mut ws_writer).await?;
             }
         }
     }

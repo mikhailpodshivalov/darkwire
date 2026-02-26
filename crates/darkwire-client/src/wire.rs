@@ -40,6 +40,10 @@ pub enum WireAction {
         request_id: Option<String>,
         event: ErrorEvent,
     },
+    RateLimited {
+        request_id: Option<String>,
+        event: RateLimitedEvent,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +103,9 @@ pub fn extract_wire_action(raw: &str) -> Option<WireAction> {
         events::names::ERROR => serde_json::from_value::<ErrorEvent>(envelope.data)
             .ok()
             .map(|event| WireAction::Error { request_id, event }),
+        events::names::RATE_LIMITED => serde_json::from_value::<RateLimitedEvent>(envelope.data)
+            .ok()
+            .map(|event| WireAction::RateLimited { request_id, event }),
         _ => None,
     }
 }
@@ -261,7 +268,8 @@ fn rate_limit_scope_name(scope: darkwire_protocol::events::RateLimitScope) -> &'
 mod tests {
     use super::*;
     use darkwire_protocol::events::{
-        Envelope, ErrorEvent, InviteCreatedEvent, LoginBindingEvent, SessionStartedEvent,
+        Envelope, ErrorEvent, InviteCreatedEvent, LoginBindingEvent, RateLimitScope,
+        RateLimitedEvent, SessionStartedEvent,
     };
 
     #[test]
@@ -320,6 +328,30 @@ mod tests {
 
         let _ = handle_server_text(&raw, &mut state);
         assert!(!state.should_initiate_handshake);
+    }
+
+    #[test]
+    fn extract_wire_action_rate_limited_parses_scope_and_retry() {
+        let raw = serde_json::to_string(
+            &Envelope::new(
+                events::names::RATE_LIMITED,
+                RateLimitedEvent {
+                    scope: RateLimitScope::MsgSend,
+                    retry_after_ms: 34,
+                },
+            )
+            .with_request_id("cli-77"),
+        )
+        .expect("serialize");
+
+        match extract_wire_action(&raw) {
+            Some(WireAction::RateLimited { request_id, event }) => {
+                assert_eq!(request_id.as_deref(), Some("cli-77"));
+                assert_eq!(event.scope, RateLimitScope::MsgSend);
+                assert_eq!(event.retry_after_ms, 34);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
     }
 
     #[test]

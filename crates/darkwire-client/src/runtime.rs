@@ -12,17 +12,19 @@ use crate::{
     wire::{extract_wire_action, handle_server_text, ClientState, WireAction},
 };
 use darkwire_protocol::events::{
-    self, E2eMsgRecvEvent, Envelope, ErrorCode, ErrorEvent, InviteCreateRequest, InviteUseRequest,
-    LoginBindRequest, LoginLookupRequest, SessionLeaveRequest,
+    self, E2eMsgRecvEvent, E2eMsgSendRequest, Envelope, ErrorCode, ErrorEvent, InviteCreateRequest,
+    InviteUseRequest, LoginBindRequest, LoginLookupRequest, RateLimitScope, RateLimitedEvent,
+    SessionLeaveRequest,
 };
 use darkwire_protocol::invite::decode_invite;
 use darkwire_protocol::login::{format_login, normalize_login};
 use futures_util::{stream::SplitSink, SinkExt};
 use recovery::RecoveryState;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use tokio::net::TcpStream;
+use tokio::time::{Duration, Instant};
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 pub type WsWriter = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
@@ -30,6 +32,16 @@ pub type WsWriter = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Messag
 const USERNAME_PROMPT: &str = "Who are you? enter your username:";
 const LOGIN_FORMAT_ERROR: &str =
     "[login] invalid login format; use 3-24 chars [a-z0-9_.-], optional @ prefix";
+const CLIENT_SEND_INTERVAL: Duration = Duration::from_millis(1050);
+const RATE_RETRY_SAFETY_BUFFER: Duration = Duration::from_millis(25);
+const OUTBOUND_INFLIGHT_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone)]
+struct QueuedOutboundMessage {
+    payload: E2eMsgSendRequest,
+    next_attempt_at: Instant,
+    retry_count: u32,
+}
 
 pub struct ClientRuntime {
     state: ClientState,
@@ -48,6 +60,9 @@ pub struct ClientRuntime {
     last_peer_login_lookup_unix: u64,
     awaiting_username_entry: bool,
     pending_invite_copy_request_id: Option<String>,
+    outbound_queue: VecDeque<QueuedOutboundMessage>,
+    outbound_inflight: HashMap<String, (QueuedOutboundMessage, Instant)>,
+    next_send_allowed_at: Instant,
     request_counter: u64,
 }
 
@@ -70,6 +85,9 @@ impl ClientRuntime {
             last_peer_login_lookup_unix: 0,
             awaiting_username_entry: false,
             pending_invite_copy_request_id: None,
+            outbound_queue: VecDeque::new(),
+            outbound_inflight: HashMap::new(),
+            next_send_allowed_at: Instant::now(),
             request_counter: 1,
         }
     }
@@ -262,9 +280,8 @@ impl ClientRuntime {
                     }
                 };
 
-                let _ = self
-                    .send_request(ws_writer, events::names::E2E_MSG_SEND, payload)
-                    .await?;
+                self.enqueue_outbound_message(payload);
+                self.flush_outbound_queue(ws_writer).await?;
                 self.persist_active_session_checkpoint()?;
                 ui.print_line(&format!("you> {}", text));
                 Ok(true)
@@ -321,6 +338,10 @@ impl ClientRuntime {
             WireAction::LoginBound { request_id, event }
             | WireAction::LoginBinding { request_id, event } => {
                 self.handle_login_binding(request_id, event.login, event.ik_ed25519, keys, ui);
+            }
+            WireAction::RateLimited { request_id, event } => {
+                self.handle_rate_limited_event(request_id, event, ui);
+                self.flush_outbound_queue(ws_writer).await?;
             }
             WireAction::Error { request_id, event } => {
                 self.handle_error_event(request_id, event, ui);
@@ -384,6 +405,11 @@ impl ClientRuntime {
         ui: &mut TerminalUi,
     ) -> Result<(), Box<dyn Error>> {
         session_flow::on_handshake_tick(self, ws_writer, ui).await
+    }
+
+    pub async fn on_outbox_tick(&mut self, ws_writer: &mut WsWriter) -> Result<(), Box<dyn Error>> {
+        self.prune_outbound_inflight();
+        self.flush_outbound_queue(ws_writer).await
     }
 
     async fn request_invite(
@@ -456,6 +482,106 @@ impl ClientRuntime {
         let raw = serde_json::to_string(&envelope)?;
         ws_writer.send(Message::Text(raw.into())).await?;
         Ok(request_id)
+    }
+
+    fn enqueue_outbound_message(&mut self, payload: E2eMsgSendRequest) {
+        self.outbound_queue.push_back(QueuedOutboundMessage {
+            payload,
+            next_attempt_at: Instant::now(),
+            retry_count: 0,
+        });
+    }
+
+    async fn flush_outbound_queue(
+        &mut self,
+        ws_writer: &mut WsWriter,
+    ) -> Result<(), Box<dyn Error>> {
+        if !self.state.active_session
+            || !self.state.secure_active
+            || self.recovery.is_send_blocked()
+        {
+            return Ok(());
+        }
+        if self
+            .active_peer_trust
+            .as_ref()
+            .is_some_and(|trust| trust.state == SessionTrustState::KeyChanged)
+        {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now < self.next_send_allowed_at {
+            return Ok(());
+        }
+
+        let Some(front) = self.outbound_queue.front() else {
+            return Ok(());
+        };
+        if front.next_attempt_at > now {
+            return Ok(());
+        }
+
+        let mut message = self
+            .outbound_queue
+            .pop_front()
+            .expect("front exists because we just checked");
+        let request_id = self
+            .send_request(
+                ws_writer,
+                events::names::E2E_MSG_SEND,
+                message.payload.clone(),
+            )
+            .await?;
+
+        let sent_at = Instant::now();
+        self.next_send_allowed_at = sent_at + CLIENT_SEND_INTERVAL;
+        message.next_attempt_at = self.next_send_allowed_at;
+        self.outbound_inflight
+            .insert(request_id, (message, sent_at));
+        Ok(())
+    }
+
+    fn handle_rate_limited_event(
+        &mut self,
+        request_id: Option<String>,
+        event: RateLimitedEvent,
+        ui: &mut TerminalUi,
+    ) {
+        if event.scope != RateLimitScope::MsgSend {
+            return;
+        }
+
+        let Some(request_id) = request_id else {
+            return;
+        };
+
+        let Some((mut message, _sent_at)) = self.outbound_inflight.remove(&request_id) else {
+            return;
+        };
+
+        let retry_delay = retry_delay_for_rate_limit(event.retry_after_ms);
+        message.next_attempt_at = Instant::now() + retry_delay;
+        message.retry_count = message.retry_count.saturating_add(1);
+        self.outbound_queue.push_front(message);
+        self.next_send_allowed_at = Instant::now() + retry_delay;
+        ui.print_line(&format!(
+            "[rate] queued resend after {}ms",
+            retry_delay.as_millis()
+        ));
+    }
+
+    fn prune_outbound_inflight(&mut self) {
+        let now = Instant::now();
+        self.outbound_inflight.retain(|_, (_, sent_at)| {
+            now.saturating_duration_since(*sent_at) <= OUTBOUND_INFLIGHT_TTL
+        });
+    }
+
+    fn clear_outbound_delivery_state(&mut self) {
+        self.outbound_queue.clear();
+        self.outbound_inflight.clear();
+        self.next_send_allowed_at = Instant::now();
     }
 
     fn print_trust_status(&self, ui: &mut TerminalUi) {
@@ -728,5 +854,26 @@ impl ClientRuntime {
         ui.print_error(&format!(
             "[trust] WARNING: peer identity key changed (prev_fp={previous_fingerprint} new_fp={new_fingerprint}); use /accept-key to continue",
         ));
+    }
+}
+
+fn retry_delay_for_rate_limit(retry_after_ms: u64) -> Duration {
+    Duration::from_millis(retry_after_ms.max(1)).saturating_add(RATE_RETRY_SAFETY_BUFFER)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_delay_has_minimum_and_safety_buffer() {
+        assert_eq!(
+            retry_delay_for_rate_limit(0),
+            Duration::from_millis(1).saturating_add(RATE_RETRY_SAFETY_BUFFER)
+        );
+        assert_eq!(
+            retry_delay_for_rate_limit(34),
+            Duration::from_millis(34).saturating_add(RATE_RETRY_SAFETY_BUFFER)
+        );
     }
 }
