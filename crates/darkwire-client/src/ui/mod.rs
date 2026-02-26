@@ -15,6 +15,8 @@ use std::{
     collections::VecDeque,
     io::{self, Write},
     process::{Command, Stdio},
+    thread,
+    time::Duration,
 };
 
 pub(super) const MAX_HISTORY_LINES: usize = 600;
@@ -444,25 +446,32 @@ fn run_clipboard_command(program: &str, args: &[&str], text: &str) -> io::Result
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()?;
 
-    if let Some(stdin) = child.stdin.as_mut() {
+    if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(text.as_bytes())?;
     }
 
-    let output = child.wait_with_output()?;
-    if output.status.success() {
-        return Ok(());
+    for _ in 0..20 {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(io::Error::other(format!(
+                "{program} exited with status {status}",
+            )));
+        }
+        thread::sleep(Duration::from_millis(5));
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let message = if stderr.is_empty() {
-        format!("{program} exited with status {}", output.status)
-    } else {
-        format!("{program}: {stderr}")
-    };
-    Err(io::Error::new(io::ErrorKind::Other, message))
+    // Some clipboard tools keep a helper process alive after accepting input.
+    // Reap it in a detached thread so UI remains responsive and no zombie remains.
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -482,7 +491,7 @@ fn clipboard_command_candidates() -> &'static [(&'static str, &'static [&'static
 fn clipboard_command_candidates() -> &'static [(&'static str, &'static [&'static str])] {
     &[
         ("wl-copy", &[]),
-        ("xclip", &["-selection", "clipboard"]),
+        ("xclip", &["-selection", "clipboard", "-in", "-silent"]),
         ("xsel", &["--clipboard", "--input"]),
     ]
 }
