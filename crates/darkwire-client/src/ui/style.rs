@@ -10,7 +10,7 @@ pub(super) fn sender_color(sender: &str) -> Option<Color> {
         "yura" => Some(Color::Blue),
         "anna" => Some(Color::Magenta),
         "bot" => Some(Color::Yellow),
-        "you" | "me" => Some(Color::Cyan),
+        "you" | "me" => Some(Color::Yellow),
         "sys" | "ready" | "event" => Some(Color::DarkGrey),
         "err" => Some(Color::Red),
         "peer" => Some(Color::White),
@@ -42,7 +42,6 @@ fn color_from_name_hash(value: &str) -> Option<Color> {
         Color::Green,
         Color::Blue,
         Color::Magenta,
-        Color::Yellow,
         Color::White,
     ];
 
