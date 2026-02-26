@@ -206,6 +206,15 @@ impl ClientRuntime {
                 self.print_trust_status(ui);
                 Ok(true)
             }
+            UserCommand::ToggleDetails => {
+                let enabled = ui.toggle_details();
+                if enabled {
+                    ui.print_line("[ui] details enabled");
+                } else {
+                    ui.print_line("[ui] clean mode enabled");
+                }
+                Ok(true)
+            }
             UserCommand::SetUsername(raw_login) => {
                 let Some(login) = self.normalize_login_or_print_error(&raw_login, ui) else {
                     return Ok(true);
