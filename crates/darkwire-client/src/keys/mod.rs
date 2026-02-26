@@ -53,6 +53,12 @@ pub struct InitiatorHandshakeContext {
     peer_opk_x25519_b64u: Option<String>,
 }
 
+impl InitiatorHandshakeContext {
+    pub fn peer_ik_ed25519(&self) -> &str {
+        &self.peer_ik_ed25519
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SecureSessionMaterial {
     pub session_id: Uuid,
