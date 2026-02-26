@@ -248,6 +248,17 @@ impl TerminalUi {
                 text: text.to_string(),
                 kind,
             }
+        } else if let Some((sender, text)) = parse_bracketed_system_line(line) {
+            ChatLine {
+                timestamp,
+                sender,
+                text,
+                kind: if is_error {
+                    ChatLineKind::Error
+                } else {
+                    ChatLineKind::System
+                },
+            }
         } else {
             ChatLine {
                 timestamp,
@@ -278,7 +289,7 @@ impl TerminalUi {
 
         let (cols, rows) = terminal_size();
         if cols < MIN_TERMINAL_WIDTH || rows < MIN_TERMINAL_HEIGHT {
-            self.render_compact(cols);
+            self.render_compact(cols, rows);
             return;
         }
 
@@ -315,17 +326,78 @@ impl TerminalUi {
         let _ = stdout.flush();
     }
 
-    fn render_compact(&mut self, cols: usize) {
+    fn render_compact(&mut self, cols: usize, rows: usize) {
         let mut stdout = io::stdout();
-        let visible = tail_chars(&self.input_buffer, cols.saturating_sub(3));
+        let width = cols.max(1);
+        let mut cursor_y = 0_u16;
+        let input_row = rows.saturating_sub(1);
+        let history_capacity = input_row.saturating_sub(1);
+
+        let _ = queue!(stdout, Hide, MoveTo(0, 0), Clear(ClearType::All));
+
+        let peer = self.active_peer.as_deref().unwrap_or("-");
+        let peer_line = truncate_with_marker(&format!("peer: {peer}"), width);
+        let _ = queue!(stdout, MoveTo(0, 0), Print(peer_line));
+
+        let menu_rows = if self.command_menu_visible() {
+            2.min(history_capacity)
+        } else {
+            0
+        };
+        let history_rows = history_capacity.saturating_sub(menu_rows);
+
+        let history_lines: Vec<&ChatLine> = self
+            .history
+            .iter()
+            .rev()
+            .take(history_rows)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        for (idx, line) in history_lines.iter().enumerate() {
+            let y = (1 + idx) as u16;
+            let compact = compact_history_row(line, width);
+            let _ = queue!(stdout, MoveTo(0, y), Print(compact));
+            cursor_y = y;
+        }
+
+        if menu_rows > 0 {
+            let (start_idx, end_idx) =
+                command_menu_window(self.command_matches.len(), self.command_selected, menu_rows);
+            let start_y = 1 + history_rows;
+            for (idx, command) in self.command_matches[start_idx..end_idx].iter().enumerate() {
+                let absolute = start_idx + idx;
+                let prefix = if absolute == self.command_selected {
+                    "/ "
+                } else {
+                    "  "
+                };
+                let line = truncate_with_marker(&format!("{prefix}{command}"), width);
+                let y = (start_y + idx) as u16;
+                let _ = queue!(stdout, MoveTo(0, y), Print(line));
+                cursor_y = y;
+            }
+        }
+
+        if cursor_y < input_row as u16 {
+            for y in (cursor_y as usize + 1)..input_row {
+                let _ = queue!(stdout, MoveTo(0, y as u16), Print(" ".repeat(width)));
+            }
+        }
+
+        let input_visible = tail_chars(&self.input_buffer, width.saturating_sub(2));
+        let input_line = format!("> {input_visible}");
         let _ = queue!(
             stdout,
-            Hide,
-            MoveTo(0, 0),
-            Clear(ClearType::All),
-            Print("darkwire ui: terminal too small\r\n"),
-            Print(format!("> {visible}")),
-            Show,
+            MoveTo(0, input_row as u16),
+            Print(pad_or_trim(&input_line, width)),
+            MoveTo(
+                input_line.chars().count().min(width) as u16,
+                input_row as u16
+            ),
+            Show
         );
         let _ = stdout.flush();
     }
@@ -411,7 +483,10 @@ impl TerminalUi {
         let _ = queue!(stdout, MoveTo(0, y), Print("║"));
 
         // Row shape: " HH:MM sender: message"
-        let sender_width = 10.min(inner.saturating_sub(10));
+        let fixed_cells_without_sender = 1 + 5 + 1 + 2;
+        let min_body_width = 8;
+        let max_sender = inner.saturating_sub(fixed_cells_without_sender + min_body_width);
+        let sender_width = max_sender.clamp(6, 16);
         let header_width = 1 + 5 + 1 + sender_width + 2;
         let body_width = inner.saturating_sub(header_width);
 
@@ -431,10 +506,17 @@ impl TerminalUi {
         let _ = queue!(stdout, Print(" "));
         used += 1;
 
-        let sender = pad_or_trim(&line.sender, sender_width);
+        let sender = pad_or_trim(
+            &truncate_with_marker(&line.sender, sender_width),
+            sender_width,
+        );
         match line.kind {
             ChatLineKind::System => {
-                let _ = queue!(stdout, SetForegroundColor(Color::DarkGrey));
+                if let Some(color) = sender_color(&line.sender) {
+                    let _ = queue!(stdout, SetForegroundColor(color));
+                } else {
+                    let _ = queue!(stdout, SetForegroundColor(Color::DarkGrey));
+                }
             }
             ChatLineKind::Error => {
                 let _ = queue!(stdout, SetForegroundColor(Color::Red));
@@ -451,7 +533,7 @@ impl TerminalUi {
         let _ = queue!(stdout, Print(": "));
         used += 2;
 
-        let body = truncate_chars(&line.text, body_width);
+        let body = truncate_with_marker(&line.text, body_width);
         match line.kind {
             ChatLineKind::Error => {
                 let _ = queue!(
@@ -595,6 +677,26 @@ fn parse_sender_line(line: &str) -> Option<(String, &str)> {
     Some((sender.to_string(), body))
 }
 
+fn parse_bracketed_system_line(line: &str) -> Option<(String, String)> {
+    if !line.starts_with('[') {
+        return None;
+    }
+
+    let end = line.find(']')?;
+    let raw_tag = line.get(1..end)?.trim();
+    let sender = raw_tag.split(':').next().unwrap_or("sys").trim();
+    let sender = if sender.is_empty() { "sys" } else { sender };
+
+    let payload = line.get(end + 1..).unwrap_or_default().trim();
+    let text = if payload.is_empty() {
+        line.to_string()
+    } else {
+        payload.to_string()
+    };
+
+    Some((sender.to_string(), text))
+}
+
 fn parse_trust_login(line: &str) -> Option<String> {
     if !line.starts_with("[trust] state=") {
         return None;
@@ -626,9 +728,17 @@ fn sender_color(sender: &str) -> Option<Color> {
         "anna" => Some(Color::Magenta),
         "bot" => Some(Color::Yellow),
         "you" | "me" => Some(Color::Cyan),
-        "sys" => Some(Color::DarkGrey),
+        "sys" | "ready" | "event" => Some(Color::DarkGrey),
         "err" => Some(Color::Red),
         "peer" => Some(Color::White),
+        "trust" => Some(Color::Yellow),
+        "e2e" => Some(Color::Cyan),
+        "keys" => Some(Color::Magenta),
+        "login" => Some(Color::Green),
+        "session" => Some(Color::Blue),
+        "invite" => Some(Color::White),
+        "rate" => Some(Color::DarkYellow),
+        "error" => Some(Color::Red),
         _ => color_from_name_hash(&normalized),
     }
 }
@@ -665,6 +775,20 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
     for ch in input.chars().take(max_chars) {
         out.push(ch);
     }
+    out
+}
+
+fn truncate_with_marker(input: &str, max_chars: usize) -> String {
+    let total = input.chars().count();
+    if total <= max_chars {
+        return input.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let mut out = truncate_chars(input, max_chars - 3);
+    out.push_str("...");
     out
 }
 
@@ -720,6 +844,15 @@ fn command_menu_window(total: usize, selected: usize, max_rows: usize) -> (usize
     }
 
     (start, end)
+}
+
+fn compact_history_row(line: &ChatLine, width: usize) -> String {
+    let sender = truncate_with_marker(&line.sender, 10);
+    let content = truncate_with_marker(&line.text, width.saturating_sub(19));
+    truncate_with_marker(
+        &format!("{} {}: {}", line.timestamp, sender, content),
+        width,
+    )
 }
 
 #[cfg(test)]
@@ -827,6 +960,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_bracketed_system_line_extracts_tag_and_payload() {
+        assert_eq!(
+            parse_bracketed_system_line("[trust] state=verified fp=123"),
+            Some(("trust".to_string(), "state=verified fp=123".to_string()))
+        );
+        assert_eq!(
+            parse_bracketed_system_line("[e2e:cli-4] handshake.init.recv"),
+            Some(("e2e".to_string(), "handshake.init.recv".to_string()))
+        );
+    }
+
+    #[test]
     fn command_menu_window_keeps_selected_in_view() {
         let (start, end) = command_menu_window(10, 8, 4);
         assert!(8 >= start && 8 < end);
@@ -837,5 +982,12 @@ mod tests {
     fn tail_chars_keeps_end_of_long_input() {
         assert_eq!(tail_chars("abcdef", 3), "def");
         assert_eq!(tail_chars("abc", 5), "abc");
+    }
+
+    #[test]
+    fn truncate_with_marker_appends_ascii_ellipsis() {
+        assert_eq!(truncate_with_marker("abcdef", 5), "ab...");
+        assert_eq!(truncate_with_marker("abc", 5), "abc");
+        assert_eq!(truncate_with_marker("abcdef", 2), "..");
     }
 }
