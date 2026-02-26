@@ -1,11 +1,11 @@
+mod recovery;
+mod session_flow;
+
 use crate::{
-    bootstrap::{
-        abort_handshake_session, handle_wire_action, now_unix, should_use_initiator_branch,
-        BootstrapState,
-    },
+    bootstrap::{now_unix, BootstrapState},
     commands::{command_help_basic_lines, parse_user_command, UserCommand},
-    e2e::{SecureMessagingError, SecureMessenger},
-    keys::{HandshakeRole, KeyManager},
+    e2e::SecureMessenger,
+    keys::KeyManager,
     session_store::SessionStore,
     trust::{fingerprint_short_for_ik, ActivePeerTrust, SessionTrustState, TrustManager},
     ui::TerminalUi,
@@ -13,11 +13,12 @@ use crate::{
 };
 use darkwire_protocol::events::{
     self, E2eMsgRecvEvent, Envelope, ErrorCode, ErrorEvent, InviteCreateRequest, InviteUseRequest,
-    LoginBindRequest, LoginLookupRequest, PrekeyGetRequest, SessionLeaveRequest,
+    LoginBindRequest, LoginLookupRequest, SessionLeaveRequest,
 };
 use darkwire_protocol::invite::decode_invite;
 use darkwire_protocol::login::{format_login, normalize_login};
 use futures_util::{stream::SplitSink, SinkExt};
+use recovery::RecoveryState;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::error::Error;
@@ -30,13 +31,6 @@ const USERNAME_PROMPT: &str = "Who are you? enter your username:";
 const LOGIN_FORMAT_ERROR: &str =
     "[login] invalid login format; use 3-24 chars [a-z0-9_.-], optional @ prefix";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecoveryRequestState {
-    Requested,
-    AlreadyRequested,
-    Unavailable,
-}
-
 pub struct ClientRuntime {
     state: ClientState,
     bootstrap: BootstrapState,
@@ -46,7 +40,7 @@ pub struct ClientRuntime {
     active_peer_trust: Option<ActivePeerTrust>,
     active_peer_login: Option<String>,
     pending_resume_peer_ik: Option<String>,
-    resume_recovery_requested: bool,
+    recovery: RecoveryState,
     local_login: Option<String>,
     pending_local_login_lookup: HashSet<String>,
     pending_peer_login_lookup: HashSet<String>,
@@ -54,8 +48,6 @@ pub struct ClientRuntime {
     last_peer_login_lookup_unix: u64,
     awaiting_username_entry: bool,
     pending_invite_copy_request_id: Option<String>,
-    secure_send_blocked: bool,
-    recovery_attempted_session_id: Option<uuid::Uuid>,
     request_counter: u64,
 }
 
@@ -70,7 +62,7 @@ impl ClientRuntime {
             active_peer_trust: None,
             active_peer_login: None,
             pending_resume_peer_ik: None,
-            resume_recovery_requested: false,
+            recovery: RecoveryState::default(),
             local_login: None,
             pending_local_login_lookup: HashSet::new(),
             pending_peer_login_lookup: HashSet::new(),
@@ -78,8 +70,6 @@ impl ClientRuntime {
             last_peer_login_lookup_unix: 0,
             awaiting_username_entry: false,
             pending_invite_copy_request_id: None,
-            secure_send_blocked: false,
-            recovery_attempted_session_id: None,
             request_counter: 1,
         }
     }
@@ -232,7 +222,7 @@ impl ClientRuntime {
                     ui.print_line("No active session. Use /my invite copy or /invite CODE");
                     return Ok(true);
                 }
-                if self.secure_send_blocked {
+                if self.recovery.is_send_blocked() {
                     ui.print_error(
                         "[e2e] secure session recovery required; wait for recovery or reconnect with /q then /invite CODE",
                     );
@@ -344,26 +334,7 @@ impl ClientRuntime {
         keys: &mut KeyManager,
         ui: &mut TerminalUi,
     ) -> Result<(), Box<dyn Error>> {
-        self.reset_secure_runtime_state(false);
-        self.bootstrap.clear();
-        self.apply_session_start_handshake_tie_break(keys, ui);
-
-        let resumed = self
-            .try_auto_resume_on_session_start(session_id, ws_writer, ui)
-            .await?;
-        self.pending_resume_peer_ik = None;
-
-        if !resumed {
-            self.forward_wire_action(
-                WireAction::SessionStarted { session_id },
-                ws_writer,
-                keys,
-                ui,
-            )
-            .await?;
-        }
-
-        Ok(())
+        session_flow::handle_session_started(self, session_id, ws_writer, keys, ui).await
     }
 
     async fn handle_encrypted_message(
@@ -372,62 +343,7 @@ impl ClientRuntime {
         ws_writer: &mut WsWriter,
         ui: &mut TerminalUi,
     ) -> Result<(), Box<dyn Error>> {
-        if !self.state.secure_active {
-            if let Some(message) = self
-                .try_auto_resume_from_incoming(&event, ws_writer, ui)
-                .await?
-            {
-                self.print_incoming_message(ui, &message);
-                self.persist_active_session_checkpoint()?;
-                return Ok(());
-            }
-
-            match self.maybe_request_recovery_handshake(ws_writer, ui).await? {
-                RecoveryRequestState::Requested => {
-                    ui.print_error(
-                        "[e2e] secure session unavailable; waiting for recovery handshake",
-                    );
-                }
-                RecoveryRequestState::AlreadyRequested => {
-                    if self.resume_recovery_requested {
-                        ui.print_error(
-                            "[e2e] secure session unavailable; recovery in progress (send is blocked)",
-                        );
-                    } else {
-                        ui.print_error(
-                            "[e2e] secure session desynchronized; reconnect with /q then /invite CODE",
-                        );
-                    }
-                }
-                RecoveryRequestState::Unavailable => {
-                    if self.secure_send_blocked {
-                        ui.print_error(
-                            "[e2e] secure session desynchronized; reconnect with /q then /invite CODE",
-                        );
-                    } else {
-                        ui.print_error("[e2e] secure session unavailable");
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        match self.secure_messenger.decrypt_incoming(&event) {
-            Ok(message) => {
-                self.print_incoming_message(ui, &message);
-                self.persist_active_session_checkpoint()?;
-                self.maybe_refresh_active_peer_login(ws_writer).await?;
-            }
-            Err(err) => {
-                if should_fail_closed_on_decrypt_error(&err) {
-                    self.enter_fail_closed_recovery(ws_writer, ui, &err).await?;
-                } else {
-                    ui.print_error(&format!("[e2e] drop inbound message: {err}"));
-                }
-            }
-        }
-
-        Ok(())
+        session_flow::handle_encrypted_message(self, event, ws_writer, ui).await
     }
 
     async fn activate_secure_material_if_ready(
@@ -436,46 +352,7 @@ impl ClientRuntime {
         keys: &mut KeyManager,
         ui: &mut TerminalUi,
     ) -> Result<(), Box<dyn Error>> {
-        let Some(material) = self.bootstrap.take_secure_session_material() else {
-            return Ok(());
-        };
-
-        if let Err(err) = self.secure_messenger.activate(&material) {
-            ui.print_error(&format!("[e2e] failed to activate secure messaging: {err}"));
-            self.state.secure_active = false;
-            return Ok(());
-        }
-
-        let trust = self.trust.evaluate_peer(&material.peer_ik_ed25519)?;
-        self.resume_recovery_requested = false;
-        self.secure_send_blocked = false;
-        self.recovery_attempted_session_id = None;
-        self.active_peer_login = None;
-        self.print_active_trust(ui, &trust);
-
-        if trust.state == SessionTrustState::KeyChanged {
-            self.session_store
-                .reset_for_local_identity(keys.identity_public_ed25519())?;
-            let previous = trust
-                .previous_fingerprint_short
-                .as_deref()
-                .unwrap_or("unknown");
-            self.print_key_changed_warning(ui, previous, &trust.fingerprint_short, None);
-        } else {
-            self.session_store.upsert(
-                &material.peer_ik_ed25519,
-                &material.root_key_b64u,
-                0,
-                0,
-                material.established_unix,
-            )?;
-        }
-
-        self.request_login_lookup_by_ik(ws_writer, &material.peer_ik_ed25519, false)
-            .await?;
-        self.active_peer_trust = Some(trust);
-
-        Ok(())
+        session_flow::activate_secure_material_if_ready(self, ws_writer, keys, ui).await
     }
 
     async fn forward_wire_action(
@@ -485,79 +362,11 @@ impl ClientRuntime {
         keys: &mut KeyManager,
         ui: &mut TerminalUi,
     ) -> Result<(), Box<dyn Error>> {
-        handle_wire_action(
-            action,
-            ws_writer,
-            &mut self.state,
-            &mut self.bootstrap,
-            keys,
-            ui,
-            &mut self.request_counter,
-        )
-        .await
-    }
-
-    fn apply_session_start_handshake_tie_break(&mut self, keys: &KeyManager, ui: &mut TerminalUi) {
-        if !self.state.should_initiate_handshake {
-            return;
-        }
-
-        let Some(peer_ik) = self.pending_resume_peer_ik.as_deref() else {
-            return;
-        };
-
-        if should_use_initiator_branch(keys.identity_public_ed25519(), peer_ik) {
-            return;
-        }
-
-        self.state.should_initiate_handshake = false;
-        ui.print_line("[e2e] simultaneous connect resolved: waiting for peer handshake.init");
-    }
-
-    async fn enter_fail_closed_recovery(
-        &mut self,
-        ws_writer: &mut WsWriter,
-        ui: &mut TerminalUi,
-        err: &SecureMessagingError,
-    ) -> Result<(), Box<dyn Error>> {
-        ui.print_error(&format!(
-            "[e2e] decrypt failed ({err}); entering fail-closed recovery mode",
-        ));
-
-        self.secure_send_blocked = true;
-        self.state.secure_active = false;
-        self.secure_messenger.clear();
-        self.resume_recovery_requested = false;
-
-        match self.maybe_request_recovery_handshake(ws_writer, ui).await? {
-            RecoveryRequestState::Requested => {}
-            RecoveryRequestState::AlreadyRequested | RecoveryRequestState::Unavailable => {
-                ui.print_error(
-                    "[e2e] recovery unavailable for this session; reconnect with /q then /invite CODE",
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    fn print_incoming_message(&self, ui: &mut TerminalUi, message: &str) {
-        let sender_label = self.incoming_sender_label();
-        ui.print_line(&format!("{sender_label} {message}"));
+        session_flow::forward_wire_action(self, action, ws_writer, keys, ui).await
     }
 
     fn reset_secure_runtime_state(&mut self, clear_pending_resume_peer: bool) {
-        self.secure_messenger.clear();
-        self.active_peer_trust = None;
-        self.active_peer_login = None;
-        self.resume_recovery_requested = false;
-        self.secure_send_blocked = false;
-        self.recovery_attempted_session_id = None;
-        self.peer_login_missing_notified = false;
-        self.last_peer_login_lookup_unix = 0;
-        if clear_pending_resume_peer {
-            self.pending_resume_peer_ik = None;
-        }
+        session_flow::reset_secure_runtime_state(self, clear_pending_resume_peer);
     }
 
     pub async fn on_handshake_tick(
@@ -565,29 +374,7 @@ impl ClientRuntime {
         ws_writer: &mut WsWriter,
         ui: &mut TerminalUi,
     ) -> Result<(), Box<dyn Error>> {
-        self.maybe_refresh_active_peer_login(ws_writer).await?;
-
-        if let Some(message) = self.bootstrap.handshake_timeout_message(now_unix()) {
-            ui.print_error(&message);
-            self.abort_handshake_session(ws_writer).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn abort_handshake_session(
-        &mut self,
-        ws_writer: &mut WsWriter,
-    ) -> Result<(), Box<dyn Error>> {
-        abort_handshake_session(
-            ws_writer,
-            &mut self.state,
-            &mut self.bootstrap,
-            &mut self.request_counter,
-        )
-        .await?;
-        self.reset_secure_runtime_state(false);
-        Ok(())
+        session_flow::on_handshake_tick(self, ws_writer, ui).await
     }
 
     async fn request_invite(
@@ -673,200 +460,8 @@ impl ClientRuntime {
         }
     }
 
-    async fn try_auto_resume_on_session_start(
-        &mut self,
-        session_id: uuid::Uuid,
-        ws_writer: &mut WsWriter,
-        ui: &mut TerminalUi,
-    ) -> Result<bool, Box<dyn Error>> {
-        if !self.state.should_initiate_handshake {
-            return Ok(false);
-        }
-
-        let Some(peer_ik_ed25519) = self.pending_resume_peer_ik.clone() else {
-            return Ok(false);
-        };
-
-        if !self.trust.is_verified(&peer_ik_ed25519) {
-            return Ok(false);
-        }
-
-        let Some(stored) = self.session_store.load_peer(&peer_ik_ed25519) else {
-            return Ok(false);
-        };
-
-        let mut resumed = SecureMessenger::default();
-        if resumed
-            .activate_resumed(
-                session_id,
-                HandshakeRole::Initiator,
-                &stored.root_key_b64u,
-                stored.send_n,
-                stored.recv_n,
-            )
-            .is_err()
-        {
-            return Ok(false);
-        }
-
-        self.secure_messenger = resumed;
-        self.state.secure_active = true;
-        self.resume_recovery_requested = false;
-        self.secure_send_blocked = false;
-        self.recovery_attempted_session_id = None;
-
-        let trust = self.trust.evaluate_peer(&peer_ik_ed25519)?;
-        self.active_peer_login = None;
-        self.active_peer_trust = Some(trust.clone());
-        self.print_active_trust(ui, &trust);
-        self.request_login_lookup_by_ik(ws_writer, &peer_ik_ed25519, false)
-            .await?;
-
-        if trust.state != SessionTrustState::Verified {
-            self.state.secure_active = false;
-            self.secure_messenger.clear();
-            return Ok(false);
-        }
-
-        self.persist_active_session_checkpoint()?;
-        ui.print_line(&format!(
-            "[e2e] secure session resumed role=initiator session={} peer_fp={}",
-            session_id, trust.fingerprint_short
-        ));
-        Ok(true)
-    }
-
-    async fn try_auto_resume_from_incoming(
-        &mut self,
-        event: &E2eMsgRecvEvent,
-        ws_writer: &mut WsWriter,
-        ui: &mut TerminalUi,
-    ) -> Result<Option<String>, Box<dyn Error>> {
-        let role = if self.state.should_initiate_handshake {
-            HandshakeRole::Initiator
-        } else {
-            HandshakeRole::Responder
-        };
-
-        for stored in self.session_store.list() {
-            if !self.trust.is_verified(&stored.peer_ik_ed25519) {
-                continue;
-            }
-
-            let mut resumed = SecureMessenger::default();
-            if resumed
-                .activate_resumed(
-                    event.session_id,
-                    role,
-                    &stored.root_key_b64u,
-                    stored.send_n,
-                    stored.recv_n,
-                )
-                .is_err()
-            {
-                continue;
-            }
-
-            let Ok(message) = resumed.decrypt_incoming(event) else {
-                continue;
-            };
-
-            let trust = self.trust.evaluate_peer(&stored.peer_ik_ed25519)?;
-            if trust.state != SessionTrustState::Verified {
-                continue;
-            }
-
-            self.secure_messenger = resumed;
-            self.state.secure_active = true;
-            self.resume_recovery_requested = false;
-            self.secure_send_blocked = false;
-            self.recovery_attempted_session_id = None;
-            self.active_peer_login = None;
-            self.active_peer_trust = Some(trust.clone());
-            self.print_active_trust(ui, &trust);
-            self.request_login_lookup_by_ik(ws_writer, &stored.peer_ik_ed25519, false)
-                .await?;
-            ui.print_line(&format!(
-                "[e2e] secure session resumed role={} session={} peer_fp={}",
-                if role == HandshakeRole::Initiator {
-                    "initiator"
-                } else {
-                    "responder"
-                },
-                event.session_id,
-                trust.fingerprint_short
-            ));
-
-            return Ok(Some(message));
-        }
-
-        Ok(None)
-    }
-
     fn persist_active_session_checkpoint(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.secure_send_blocked {
-            return Ok(());
-        }
-
-        let Some(active_peer) = self.active_peer_trust.as_ref() else {
-            return Ok(());
-        };
-        let Some(snapshot) = self.secure_messenger.snapshot() else {
-            return Ok(());
-        };
-
-        let now = now_unix();
-        let existing = self.session_store.load_peer(&active_peer.peer_ik_ed25519);
-        match existing {
-            Some(existing) if existing.root_key_b64u == snapshot.root_key_b64u => {
-                self.session_store.update_counters(
-                    &active_peer.peer_ik_ed25519,
-                    snapshot.send_n,
-                    snapshot.recv_n,
-                )
-            }
-            _ => self.session_store.upsert(
-                &active_peer.peer_ik_ed25519,
-                &snapshot.root_key_b64u,
-                snapshot.send_n,
-                snapshot.recv_n,
-                now,
-            ),
-        }
-    }
-
-    async fn maybe_request_recovery_handshake(
-        &mut self,
-        ws_writer: &mut WsWriter,
-        ui: &mut TerminalUi,
-    ) -> Result<RecoveryRequestState, Box<dyn Error>> {
-        if !self.state.active_session || self.state.active_session_id.is_none() {
-            return Ok(RecoveryRequestState::Unavailable);
-        }
-        if self.state.secure_active {
-            return Ok(RecoveryRequestState::Unavailable);
-        }
-
-        let Some(session_id) = self.state.active_session_id else {
-            return Ok(RecoveryRequestState::Unavailable);
-        };
-
-        if self.resume_recovery_requested || self.recovery_attempted_session_id == Some(session_id)
-        {
-            return Ok(RecoveryRequestState::AlreadyRequested);
-        }
-
-        let _ = self
-            .send_request(
-                ws_writer,
-                events::names::E2E_PREKEY_GET,
-                PrekeyGetRequest { session_id },
-            )
-            .await?;
-        self.resume_recovery_requested = true;
-        self.recovery_attempted_session_id = Some(session_id);
-        ui.print_line("[e2e] resume unavailable, requesting prekey bundle for recovery");
-        Ok(RecoveryRequestState::Requested)
+        session_flow::persist_active_session_checkpoint(self)
     }
 
     async fn maybe_refresh_active_peer_login(
@@ -1006,7 +601,7 @@ impl ClientRuntime {
     ) {
         let request_id = request_id.unwrap_or_default();
 
-        if self.secure_send_blocked
+        if self.recovery.is_send_blocked()
             && matches!(
                 &event.code,
                 ErrorCode::PrekeyNotFound
@@ -1016,7 +611,7 @@ impl ClientRuntime {
                     | ErrorCode::NoActiveSession
             )
         {
-            self.resume_recovery_requested = false;
+            self.recovery.clear_request_in_flight();
         }
 
         if self.pending_invite_copy_request_id.as_deref() == Some(request_id.as_str()) {
@@ -1124,86 +719,6 @@ impl ClientRuntime {
 
         ui.print_error(&format!(
             "[trust] WARNING: peer identity key changed (prev_fp={previous_fingerprint} new_fp={new_fingerprint}); use /accept-key to continue",
-        ));
-    }
-}
-
-#[cfg(test)]
-fn should_request_recovery_handshake(state: &ClientState, recovery_requested: bool) -> bool {
-    state.active_session
-        && !state.secure_active
-        && state.active_session_id.is_some()
-        && !recovery_requested
-}
-
-fn should_fail_closed_on_decrypt_error(err: &SecureMessagingError) -> bool {
-    !matches!(err, SecureMessagingError::ReplayDetected(_))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use uuid::Uuid;
-
-    #[test]
-    fn recovery_request_predicate_true_for_unsecured_active_session() {
-        let state = ClientState {
-            active_session: true,
-            active_session_id: Some(Uuid::new_v4()),
-            secure_active: false,
-            should_initiate_handshake: false,
-        };
-
-        assert!(should_request_recovery_handshake(&state, false));
-    }
-
-    #[test]
-    fn recovery_request_predicate_false_when_already_requested() {
-        let state = ClientState {
-            active_session: true,
-            active_session_id: Some(Uuid::new_v4()),
-            secure_active: false,
-            should_initiate_handshake: false,
-        };
-
-        assert!(!should_request_recovery_handshake(&state, true));
-    }
-
-    #[test]
-    fn recovery_request_predicate_false_when_secure_is_active() {
-        let state = ClientState {
-            active_session: true,
-            active_session_id: Some(Uuid::new_v4()),
-            secure_active: true,
-            should_initiate_handshake: false,
-        };
-
-        assert!(!should_request_recovery_handshake(&state, false));
-    }
-
-    #[test]
-    fn fail_closed_filter_allows_replay_without_degrade() {
-        assert!(!should_fail_closed_on_decrypt_error(
-            &SecureMessagingError::ReplayDetected(3)
-        ));
-    }
-
-    #[test]
-    fn fail_closed_filter_triggers_for_nonce_and_gap_errors() {
-        assert!(should_fail_closed_on_decrypt_error(
-            &SecureMessagingError::NonceMismatch
-        ));
-        assert!(should_fail_closed_on_decrypt_error(
-            &SecureMessagingError::SkippedWindowOverflow {
-                limit: 10,
-                pending: 9
-            }
-        ));
-        assert!(should_fail_closed_on_decrypt_error(
-            &SecureMessagingError::OutOfOrder {
-                expected: 1,
-                got: 2048
-            }
         ));
     }
 }
