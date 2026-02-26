@@ -162,7 +162,7 @@ impl ClientRuntime {
                 Ok(true)
             }
             UserCommand::Unknown => {
-                ui.print_line("Unknown command. Use /help or /help all");
+                ui.print_line("Unknown command. Use /help");
                 Ok(true)
             }
             UserCommand::KeyStatus => {
@@ -337,7 +337,7 @@ impl ClientRuntime {
             }
             UserCommand::SendMessage(text) => {
                 if !self.state.active_session {
-                    ui.print_line("No active session. Use /new or /c CODE");
+                    ui.print_line("No active session. Use /my invite copy or /invite CODE");
                     return Ok(true);
                 }
                 if !self.state.secure_active {
@@ -1064,11 +1064,11 @@ impl ClientRuntime {
         match event.code {
             ErrorCode::LoginTaken => ui.print_error("[login] this username is already taken"),
             ErrorCode::LoginInvalid => {
-                ui.print_error("[login] invalid username/signature; use /me @name")
+                ui.print_error("[login] invalid username/signature; use /login @name")
             }
-            ErrorCode::LoginKeyMismatch => ui.print_error(
-                "[login] signature or identity mismatch; run /keys and retry /me @name",
-            ),
+            ErrorCode::LoginKeyMismatch => {
+                ui.print_error("[login] signature or identity mismatch; retry /login @name")
+            }
             ErrorCode::LoginNotFound => ui.print_line("[login] username not found"),
             _ => {}
         }
@@ -1113,7 +1113,7 @@ impl ClientRuntime {
 
     fn copy_last_invite_or_print(&self, ui: &mut TerminalUi) {
         let Some(invite) = self.last_invite_code.as_deref() else {
-            ui.print_line("[invite] no invite available yet; run /new first");
+            ui.print_line("[invite] no invite available yet; run /my invite copy first");
             return;
         };
         self.copy_invite_or_print(ui, invite);

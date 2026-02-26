@@ -413,25 +413,25 @@ mod tests {
 
         let enter = ui.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(enter.is_none());
-        assert_eq!(ui.input_buffer, "/help all");
+        assert_eq!(ui.input_buffer, "/my invite copy");
     }
 
     #[test]
     fn slash_menu_argument_template_waits_for_argument() {
         let mut ui = TerminalUi::new(false);
         let _ = ui.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        let _ = ui.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        let _ = ui.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
 
         let first_enter = ui.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(first_enter.is_none());
-        assert_eq!(ui.input_buffer, "/c ");
+        assert_eq!(ui.input_buffer, "/invite ");
 
         let second_enter = ui.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(second_enter.is_none());
 
         let _ = ui.handle_key_event(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
         let submitted = ui.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(submitted.as_deref(), Some("/c X"));
+        assert_eq!(submitted.as_deref(), Some("/invite X"));
     }
 
     #[test]

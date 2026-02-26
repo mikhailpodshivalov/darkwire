@@ -676,7 +676,7 @@ mod tests {
         let mut ui = TerminalUi::new(false);
         ui.active_peer = Some("@anna".to_string());
         ui.input_buffer = "/he".to_string();
-        ui.command_matches = vec!["/help", "/help all"];
+        ui.command_matches = vec!["/help", "/my invite copy"];
         ui.command_selected = 1;
         ui.history.push_back(ChatLine {
             timestamp: "12:03".to_string(),
@@ -689,7 +689,7 @@ mod tests {
         assert_eq!(lines[0], "peer: @anna");
         assert!(lines[1].contains("12:03"));
         assert_eq!(lines[4], "  /help");
-        assert_eq!(lines[5], "/ /help all");
+        assert_eq!(lines[5], "/ /my invite copy");
         assert!(lines[6].contains("> /he"));
     }
 }

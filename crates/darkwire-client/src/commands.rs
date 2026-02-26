@@ -46,6 +46,47 @@ pub fn parse_user_command(line: &str) -> UserCommand {
         }
     }
 
+    if trimmed.starts_with("/my") {
+        let mut parts = trimmed.split_whitespace();
+        let command = parts.next();
+        let scope = parts.next();
+        let action = parts.next();
+        let extra = parts.next();
+        if command == Some("/my")
+            && scope == Some("invite")
+            && action == Some("copy")
+            && extra.is_none()
+        {
+            return UserCommand::CreateInviteAndCopy;
+        }
+    }
+
+    if trimmed.starts_with("/invite") {
+        let mut parts = trimmed.split_whitespace();
+        let command = parts.next();
+        let invite = parts.next();
+        let extra = parts.next();
+        if command == Some("/invite") && extra.is_none() {
+            if let Some(invite) = invite {
+                return UserCommand::ConnectInvite(invite.to_string());
+            }
+            return UserCommand::Unknown;
+        }
+    }
+
+    if trimmed.starts_with("/login ") {
+        let mut parts = trimmed.split_whitespace();
+        let command = parts.next();
+        let login = parts.next();
+        let extra = parts.next();
+        if command == Some("/login")
+            && extra.is_none()
+            && matches!(login, Some(value) if value.starts_with('@'))
+        {
+            return UserCommand::SetUsername(login.unwrap_or_default().to_string());
+        }
+    }
+
     if trimmed == "/new" || trimmed == "/i" {
         return UserCommand::CreateInvite;
     }
@@ -164,66 +205,29 @@ pub fn parse_user_command(line: &str) -> UserCommand {
 
 pub fn command_help_basic_lines() -> &'static [&'static str] {
     &[
-        "/help - show basic help",
-        "/help all - show full command list",
-        "/new (/i) - create new invite",
-        "/new copy - create invite and copy to clipboard",
-        "/copy - copy latest invite to clipboard",
-        "/c CODE - connect by invite code",
-        "/me @name - set or change your username",
+        "/help - show commands",
+        "/my invite copy - create invite and copy to clipboard",
+        "/invite CODE - connect by invite code",
+        "/login @name - set or change your username",
         "/accept-key - accept peer key change and continue",
+        "/trust - show active peer trust status",
         "/q - quit",
         "<text> - send encrypted message in active secure session",
     ]
 }
 
 pub fn command_help_all_lines() -> &'static [&'static str] {
-    &[
-        "/help - show basic help",
-        "/help all - show full command list",
-        "/new (/i) - create new invite",
-        "/new copy - create invite and copy to clipboard",
-        "/copy - copy latest invite to clipboard",
-        "/c CODE - connect by invite code",
-        "/me @name - set or change your username",
-        "/accept-key - accept peer key change and continue",
-        "/keys - show local key status",
-        "/keys rotate - rotate signed prekey",
-        "/keys refill - refill one-time prekeys",
-        "/keys revoke - regenerate identity + prekeys",
-        "/trust - show active peer trust status",
-        "/trust verify - mark active peer as verified",
-        "/trust unverify - remove verification for active peer",
-        "/trust list - list verified peers",
-        "/login - show local login binding status",
-        "/login set @name - bind login to local identity key",
-        "/login lookup @name - resolve login to identity fingerprint",
-        "/q - quit",
-        "<text> - send encrypted message in active secure session",
-    ]
+    command_help_basic_lines()
 }
 
 pub fn command_palette_items() -> &'static [&'static str] {
     &[
         "/help",
-        "/help all",
-        "/new",
-        "/new copy",
-        "/i",
-        "/c ",
-        "/copy",
-        "/me @",
-        "/accept-key",
-        "/keys",
-        "/keys rotate",
-        "/keys refill",
-        "/keys revoke",
+        "/my invite copy",
+        "/invite ",
+        "/login @",
         "/trust",
-        "/trust verify",
-        "/trust unverify",
-        "/trust list",
-        "/login",
-        "/login lookup ",
+        "/accept-key",
         "/q",
     ]
 }
@@ -241,6 +245,14 @@ mod tests {
     fn parse_command_invite_create_and_copy() {
         assert_eq!(
             parse_user_command("/new copy"),
+            UserCommand::CreateInviteAndCopy
+        );
+    }
+
+    #[test]
+    fn parse_command_invite_create_and_copy_new_name() {
+        assert_eq!(
+            parse_user_command("/my invite copy"),
             UserCommand::CreateInviteAndCopy
         );
     }
@@ -281,6 +293,14 @@ mod tests {
     fn parse_command_invite_connect() {
         assert_eq!(
             parse_user_command("/c DL1:abc.def"),
+            UserCommand::ConnectInvite("DL1:abc.def".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_command_invite_connect_new_name() {
+        assert_eq!(
+            parse_user_command("/invite DL1:abc.def"),
             UserCommand::ConnectInvite("DL1:abc.def".to_string())
         );
     }
@@ -327,6 +347,14 @@ mod tests {
     fn parse_command_set_username() {
         assert_eq!(
             parse_user_command("/me @mike"),
+            UserCommand::SetUsername("@mike".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_command_set_username_new_name() {
+        assert_eq!(
+            parse_user_command("/login @mike"),
             UserCommand::SetUsername("@mike".to_string())
         );
     }
@@ -417,19 +445,21 @@ mod tests {
     #[test]
     fn all_help_lines_include_advanced_commands() {
         let help = command_help_all_lines().join("\n");
-        assert!(help.contains("/me @name"));
+        assert!(help.contains("/my invite copy"));
+        assert!(help.contains("/invite CODE"));
+        assert!(help.contains("/login @name"));
         assert!(help.contains("/accept-key"));
-        assert!(help.contains("/keys rotate"));
-        assert!(help.contains("/trust verify"));
-        assert!(help.contains("/login set @name"));
+        assert!(!help.contains("/keys rotate"));
+        assert!(!help.contains("/trust verify"));
     }
 
     #[test]
     fn command_palette_includes_common_entries() {
         let entries = command_palette_items();
         assert!(entries.contains(&"/help"));
-        assert!(entries.contains(&"/c "));
-        assert!(entries.contains(&"/me @"));
+        assert!(entries.contains(&"/my invite copy"));
+        assert!(entries.contains(&"/invite "));
+        assert!(entries.contains(&"/login @"));
         assert!(entries.contains(&"/q"));
     }
 }
