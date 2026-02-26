@@ -142,3 +142,9 @@ darkwire --demo-incoming-ms 200
 ```bash
 ./scripts/smoke.sh
 ```
+
+Targeted client reliability regressions:
+
+```bash
+./scripts/smoke-reliability.sh
+```

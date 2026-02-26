@@ -100,6 +100,49 @@ mod tests {
     }
 
     #[test]
+    fn recovery_request_is_limited_to_one_attempt_per_session() {
+        let session_id = Uuid::new_v4();
+        let state = ClientState {
+            active_session: true,
+            active_session_id: Some(session_id),
+            secure_active: false,
+            should_initiate_handshake: false,
+        };
+        let mut recovery = RecoveryState::default();
+
+        assert_eq!(
+            recovery.request_state_for(&state),
+            RecoveryRequestState::Requested
+        );
+        recovery.mark_recovery_requested(session_id);
+        recovery.clear_request_in_flight();
+        assert_eq!(
+            recovery.request_state_for(&state),
+            RecoveryRequestState::AlreadyRequested
+        );
+    }
+
+    #[test]
+    fn recovery_request_is_allowed_for_new_session_after_prior_attempt() {
+        let first_session = Uuid::new_v4();
+        let second_session = Uuid::new_v4();
+        let mut recovery = RecoveryState::default();
+        recovery.mark_recovery_requested(first_session);
+        recovery.clear_request_in_flight();
+
+        let second_state = ClientState {
+            active_session: true,
+            active_session_id: Some(second_session),
+            secure_active: false,
+            should_initiate_handshake: false,
+        };
+        assert_eq!(
+            recovery.request_state_for(&second_state),
+            RecoveryRequestState::Requested
+        );
+    }
+
+    #[test]
     fn request_state_false_when_secure_is_active() {
         let state = ClientState {
             active_session: true,

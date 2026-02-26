@@ -16,4 +16,7 @@ cargo test -p darkwire-relay integration_two_clients_can_chat_and_disconnect_end
 echo "[smoke] relay integration: invite.use backoff"
 cargo test -p darkwire-relay integration_invite_use_backoff_emits_rate_limited_after_failed_attempts -- --nocapture
 
+echo "[smoke] client reliability regressions"
+"$ROOT_DIR/scripts/smoke-reliability.sh"
+
 echo "[smoke] OK"
