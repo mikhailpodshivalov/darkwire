@@ -22,7 +22,7 @@ use futures_util::{stream::SplitSink, SinkExt};
 use outbox::OutboxState;
 use recovery::RecoveryState;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
@@ -44,6 +44,7 @@ pub struct ClientRuntime {
     pending_resume_peer_ik: Option<String>,
     recovery: RecoveryState,
     local_login: Option<String>,
+    known_peer_logins: HashMap<String, String>,
     pending_local_login_lookup: HashSet<String>,
     pending_peer_login_lookup: HashSet<String>,
     peer_login_missing_notified: bool,
@@ -67,6 +68,7 @@ impl ClientRuntime {
             pending_resume_peer_ik: None,
             recovery: RecoveryState::default(),
             local_login: None,
+            known_peer_logins: HashMap::new(),
             pending_local_login_lookup: HashSet::new(),
             pending_peer_login_lookup: HashSet::new(),
             peer_login_missing_notified: false,
@@ -560,6 +562,10 @@ impl ClientRuntime {
             return format!("{}>", format_login(login));
         }
 
+        if let Some(active) = self.active_peer_trust.as_ref() {
+            return format!("fp:{}>", active.fingerprint_short);
+        }
+
         "peer>".to_string()
     }
 
@@ -580,6 +586,16 @@ impl ClientRuntime {
         let formatted = format_login(&login);
         let is_local = ik_ed25519 == keys.identity_public_ed25519();
         let mut is_active_peer = false;
+
+        if !is_local {
+            self.known_peer_logins
+                .insert(ik_ed25519.clone(), login.clone());
+            if let Err(err) = self.trust.remember_peer_login(&ik_ed25519, &login) {
+                ui.print_error(&format!(
+                    "[login] failed to persist peer username cache: {err}"
+                ));
+            }
+        }
 
         if let Some(active) = self.active_peer_trust.clone() {
             if active.peer_ik_ed25519 == ik_ed25519 {
@@ -706,6 +722,13 @@ impl ClientRuntime {
         };
 
         Some(login)
+    }
+
+    fn cached_login_for_peer(&self, peer_ik_ed25519: &str) -> Option<String> {
+        self.trust
+            .login_for_peer(peer_ik_ed25519)
+            .map(str::to_string)
+            .or_else(|| self.known_peer_logins.get(peer_ik_ed25519).cloned())
     }
 
     fn copy_invite_or_print(&self, ui: &mut TerminalUi, invite: &str) {

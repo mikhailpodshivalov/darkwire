@@ -2,7 +2,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fs::{self, OpenOptions},
     io::Write,
@@ -99,6 +99,38 @@ impl TrustManager {
             .contains(peer_ik_ed25519)
     }
 
+    pub fn login_for_peer(&self, peer_ik_ed25519: &str) -> Option<&str> {
+        self.store
+            .login_by_peer_ik
+            .get(peer_ik_ed25519)
+            .map(String::as_str)
+    }
+
+    pub fn remember_peer_login(
+        &mut self,
+        peer_ik_ed25519: &str,
+        login: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        if peer_ik_ed25519.trim().is_empty() || login.trim().is_empty() {
+            return Ok(());
+        }
+
+        if self
+            .store
+            .login_by_peer_ik
+            .get(peer_ik_ed25519)
+            .is_some_and(|known| known == login)
+        {
+            return Ok(());
+        }
+
+        self.store
+            .login_by_peer_ik
+            .insert(peer_ik_ed25519.to_string(), login.to_string());
+        self.store.updated_unix = now_unix();
+        self.persist()
+    }
+
     pub fn evaluate_peer(
         &mut self,
         peer_ik_ed25519: &str,
@@ -177,6 +209,8 @@ struct TrustStoreFile {
     updated_unix: u64,
     verified_peer_ik_ed25519: BTreeSet<String>,
     last_seen_peer_ik_ed25519: Option<String>,
+    #[serde(default)]
+    login_by_peer_ik: BTreeMap<String, String>,
 }
 
 impl TrustStoreFile {
@@ -187,6 +221,7 @@ impl TrustStoreFile {
             updated_unix: now_unix,
             verified_peer_ik_ed25519: BTreeSet::new(),
             last_seen_peer_ik_ed25519: None,
+            login_by_peer_ik: BTreeMap::new(),
         }
     }
 }
@@ -403,6 +438,31 @@ mod tests {
         assert_eq!(
             default_trust_file_path(Path::new("keys.json")),
             PathBuf::from("keys.trust.json")
+        );
+    }
+
+    #[test]
+    fn remember_peer_login_persists_between_reloads() {
+        let trust_file = temp_trust_file();
+        let ik = peer_ik(3);
+
+        {
+            let mut trust = TrustManager::load_or_init(trust_file.clone()).expect("init trust");
+            trust
+                .remember_peer_login(&ik, "john")
+                .expect("remember login");
+            assert_eq!(trust.login_for_peer(&ik), Some("john"));
+        }
+
+        {
+            let trust = TrustManager::load_or_init(trust_file.clone()).expect("reload trust");
+            assert_eq!(trust.login_for_peer(&ik), Some("john"));
+        }
+
+        let _ = fs::remove_dir_all(
+            trust_file
+                .parent()
+                .expect("temp trust file should have a parent"),
         );
     }
 }
