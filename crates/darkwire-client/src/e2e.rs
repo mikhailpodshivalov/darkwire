@@ -14,6 +14,7 @@ const DIR_RESPONDER_TO_INITIATOR: &[u8] = b"darkwire-e2e-dir-resp->init-v1";
 const CHAIN_PUBLIC_CONTEXT: &[u8] = b"darkwire-e2e-chain-public-v1";
 const MESSAGE_KEY_CONTEXT: &[u8] = b"darkwire-e2e-msg-key-v1";
 const MESSAGE_NONCE_CONTEXT: &[u8] = b"darkwire-e2e-msg-nonce-v1";
+const MAX_FORWARD_GAP: u64 = 1024;
 
 #[derive(Debug, Default)]
 pub struct SecureMessenger {
@@ -191,7 +192,7 @@ impl SecureMessenger {
         if event.n < expected {
             return Err(SecureMessagingError::ReplayDetected(event.n));
         }
-        if event.n > expected {
+        if event.n.saturating_sub(expected) > MAX_FORWARD_GAP {
             return Err(SecureMessagingError::OutOfOrder {
                 expected,
                 got: event.n,
@@ -376,6 +377,41 @@ mod tests {
             .decrypt_incoming(&encrypted)
             .expect_err("replay must fail");
         assert!(matches!(replay, SecureMessagingError::ReplayDetected(1)));
+    }
+
+    #[test]
+    fn missing_counter_gap_is_accepted() {
+        let init_material = material_for(HandshakeRole::Initiator);
+        let mut resp_material = material_for(HandshakeRole::Responder);
+        resp_material.session_id = init_material.session_id;
+        resp_material.hs_id = init_material.hs_id;
+        resp_material.root_key_b64u = init_material.root_key_b64u.clone();
+
+        let mut initiator = SecureMessenger::default();
+        let mut responder = SecureMessenger::default();
+        initiator
+            .activate(&init_material)
+            .expect("activate initiator");
+        responder
+            .activate(&resp_material)
+            .expect("activate responder");
+
+        let first = initiator.encrypt_outgoing("m1").expect("encrypt m1");
+        let second = initiator.encrypt_outgoing("m2").expect("encrypt m2");
+        let third = initiator.encrypt_outgoing("m3").expect("encrypt m3");
+
+        let first_plain = responder.decrypt_incoming(&first).expect("decrypt m1");
+        assert_eq!(first_plain, "m1");
+        let third_plain = responder.decrypt_incoming(&third).expect("decrypt m3");
+        assert_eq!(third_plain, "m3");
+
+        let late_second = responder
+            .decrypt_incoming(&second)
+            .expect_err("late m2 should be rejected after moving recv counter");
+        assert!(matches!(
+            late_second,
+            SecureMessagingError::ReplayDetected(2)
+        ));
     }
 
     #[test]
