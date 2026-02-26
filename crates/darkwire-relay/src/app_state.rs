@@ -1275,7 +1275,8 @@ mod tests {
         let state = AppState::new(LimitsConfig::default());
         let (tx, _rx) = channel();
         let inviter = state.register_connection(test_ip(9), tx).await;
-        let ik_hint = "ik_hint_test_value";
+        let identity = generate_identity_keypair();
+        let ik_hint = keypair_public_b64u(&identity);
 
         let created = state
             .create_invite(
@@ -1285,14 +1286,14 @@ mod tests {
                     r: vec!["ws://127.0.0.1:7000".to_string()],
                     e: 600,
                     o: true,
-                    k: Some(ik_hint.to_string()),
+                    k: Some(ik_hint.clone()),
                 },
             )
             .await
             .expect("invite create should pass");
 
         let decoded = decode_invite(&created.invite).expect("created invite should decode");
-        assert_eq!(decoded.k.as_deref(), Some(ik_hint));
+        assert_eq!(decoded.k.as_deref(), Some(ik_hint.as_str()));
     }
 
     #[tokio::test]

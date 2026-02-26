@@ -7,6 +7,7 @@ pub const INVITE_VERSION: u8 = 1;
 pub const TOKEN_MIN_LEN: usize = 12;
 pub const TOKEN_MAX_LEN: usize = 16;
 pub const MAX_TTL_SECONDS: u32 = 24 * 60 * 60;
+const IDENTITY_HINT_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InvitePayloadV1 {
@@ -46,6 +47,15 @@ impl InvitePayloadV1 {
             return Err(InviteError::InvalidTtlSeconds(self.e));
         }
 
+        if let Some(identity_hint) = self.k.as_deref() {
+            let decoded_hint = BASE64URL_NOPAD
+                .decode(identity_hint.as_bytes())
+                .map_err(InviteError::InvalidIdentityHintEncoding)?;
+            if decoded_hint.len() != IDENTITY_HINT_BYTES {
+                return Err(InviteError::InvalidIdentityHintLength(decoded_hint.len()));
+            }
+        }
+
         Ok(())
     }
 }
@@ -68,6 +78,10 @@ pub enum InviteError {
     InvalidTokenChars,
     #[error("TTL seconds must be in 1..={MAX_TTL_SECONDS}, got {0}")]
     InvalidTtlSeconds(u32),
+    #[error("identity hint is not valid base64url: {0}")]
+    InvalidIdentityHintEncoding(data_encoding::DecodeError),
+    #[error("identity hint must decode to 32 bytes, got {0}")]
+    InvalidIdentityHintLength(usize),
     #[error("payload is not valid base64url: {0}")]
     InvalidPayloadEncoding(data_encoding::DecodeError),
     #[error("checksum is not valid base32: {0}")]
@@ -221,5 +235,21 @@ mod tests {
         ];
         let err = payload.validate().expect_err("relay list >3 should fail");
         assert!(matches!(err, InviteError::InvalidRelayCount(4)));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_identity_hint() {
+        let mut payload = sample_payload();
+        payload.k = Some("not_base64url".to_string());
+        let err = payload
+            .validate()
+            .expect_err("invalid base64url identity hint should fail");
+        assert!(matches!(err, InviteError::InvalidIdentityHintEncoding(_)));
+
+        payload.k = Some("QQ".to_string());
+        let err = payload
+            .validate()
+            .expect_err("identity hint length must be 32 bytes");
+        assert!(matches!(err, InviteError::InvalidIdentityHintLength(1)));
     }
 }

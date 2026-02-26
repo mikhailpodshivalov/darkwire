@@ -34,11 +34,18 @@ impl SessionStore {
         ensure_parent_dir(&session_file)?;
 
         let mut manager = if session_file.exists() {
-            let raw = fs::read_to_string(&session_file)?;
-            let store: SessionStoreFile = serde_json::from_str(&raw)?;
-            Self {
-                session_file,
-                store,
+            match fs::read_to_string(&session_file)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<SessionStoreFile>(&raw).ok())
+            {
+                Some(store) => Self {
+                    session_file,
+                    store,
+                },
+                None => Self {
+                    session_file,
+                    store: SessionStoreFile::new(local_ik_ed25519.to_string(), now_unix()),
+                },
             }
         } else {
             Self {
@@ -146,9 +153,8 @@ impl SessionStore {
 
     fn enforce_invariants(&mut self, local_ik_ed25519: &str) -> Result<(), Box<dyn Error>> {
         if self.store.version != SESSION_STORE_VERSION {
-            return Err(
-                format!("unsupported session store version: {}", self.store.version).into(),
-            );
+            self.store = SessionStoreFile::new(local_ik_ed25519.to_string(), now_unix());
+            return Ok(());
         }
 
         if self.store.local_ik_ed25519 != local_ik_ed25519 {
@@ -361,6 +367,64 @@ mod tests {
 
         let reloaded = SessionStore::load_or_init(session_file.clone(), "local-ik-b")
             .expect("reload should pass");
+        assert_eq!(reloaded.session_count(), 0);
+
+        let _ = fs::remove_dir_all(
+            session_file
+                .parent()
+                .expect("temp session file should have a parent"),
+        );
+    }
+
+    #[test]
+    fn corrupted_json_recovers_with_empty_store() {
+        let session_file = temp_session_file();
+        let parent = session_file
+            .parent()
+            .expect("temp session file should have a parent");
+        fs::create_dir_all(parent).expect("create temp dir");
+        fs::write(&session_file, "{broken-json").expect("write corrupted store");
+
+        let store = SessionStore::load_or_init(session_file.clone(), "local-ik")
+            .expect("corrupted session store should recover");
+        assert_eq!(store.session_count(), 0);
+
+        let raw = fs::read_to_string(&session_file).expect("repaired store should be persisted");
+        let persisted: serde_json::Value =
+            serde_json::from_str(&raw).expect("repaired store must be valid json");
+        assert_eq!(
+            persisted
+                .get("local_ik_ed25519")
+                .and_then(serde_json::Value::as_str),
+            Some("local-ik")
+        );
+
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn unsupported_version_resets_store() {
+        let session_file = temp_session_file();
+        let mut store = SessionStore::load_or_init(session_file.clone(), "local-ik")
+            .expect("session store init should pass");
+        store
+            .upsert(&peer_ik(7), "rk-7", 1, 1, 100)
+            .expect("upsert should pass");
+        assert_eq!(store.session_count(), 1);
+
+        let mut json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&session_file).expect("session store should exist"),
+        )
+        .expect("session store json should parse");
+        json["version"] = serde_json::json!(999);
+        fs::write(
+            &session_file,
+            serde_json::to_string(&json).expect("serialize mutated json"),
+        )
+        .expect("write mutated store");
+
+        let reloaded = SessionStore::load_or_init(session_file.clone(), "local-ik")
+            .expect("unsupported version should reset");
         assert_eq!(reloaded.session_count(), 0);
 
         let _ = fs::remove_dir_all(
