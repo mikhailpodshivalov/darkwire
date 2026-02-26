@@ -1,6 +1,6 @@
 use crate::{
     bootstrap::{abort_handshake_session, handle_wire_action, now_unix, BootstrapState},
-    commands::{command_help_all_lines, command_help_basic_lines, parse_user_command, UserCommand},
+    commands::{command_help_basic_lines, parse_user_command, UserCommand},
     e2e::SecureMessenger,
     keys::{HandshakeRole, KeyManager},
     session_store::SessionStore,
@@ -40,11 +40,9 @@ pub struct ClientRuntime {
     local_login: Option<String>,
     pending_local_login_lookup: HashSet<String>,
     pending_peer_login_lookup: HashSet<String>,
-    pending_named_login_lookup: HashSet<String>,
     peer_login_missing_notified: bool,
     last_peer_login_lookup_unix: u64,
     awaiting_username_entry: bool,
-    last_invite_code: Option<String>,
     pending_invite_copy_request_id: Option<String>,
     request_counter: u64,
 }
@@ -64,11 +62,9 @@ impl ClientRuntime {
             local_login: None,
             pending_local_login_lookup: HashSet::new(),
             pending_peer_login_lookup: HashSet::new(),
-            pending_named_login_lookup: HashSet::new(),
             peer_login_missing_notified: false,
             last_peer_login_lookup_unix: 0,
             awaiting_username_entry: false,
-            last_invite_code: None,
             pending_invite_copy_request_id: None,
             request_counter: 1,
         }
@@ -148,60 +144,14 @@ impl ClientRuntime {
         match command {
             UserCommand::Ignore => Ok(true),
             UserCommand::Help => {
-                ui.print_line("Commands (basic):");
+                ui.print_line("Commands:");
                 for line in command_help_basic_lines() {
-                    ui.print_line(line);
-                }
-                Ok(true)
-            }
-            UserCommand::HelpAll => {
-                ui.print_line("Commands (all):");
-                for line in command_help_all_lines() {
                     ui.print_line(line);
                 }
                 Ok(true)
             }
             UserCommand::Unknown => {
                 ui.print_line("Unknown command. Use /help");
-                Ok(true)
-            }
-            UserCommand::KeyStatus => {
-                ui.print_line(&format!("[keys] {}", keys.status_line()));
-                Ok(true)
-            }
-            UserCommand::KeyRotate => {
-                keys.rotate_signed_prekey()?;
-                self.publish_prekeys(ws_writer, keys).await?;
-                ui.print_line(&format!(
-                    "[keys] rotated + published {}",
-                    keys.status_line()
-                ));
-                Ok(true)
-            }
-            UserCommand::KeyRefill => {
-                let added = keys.refill_one_time_prekeys()?;
-                self.publish_prekeys(ws_writer, keys).await?;
-                ui.print_line(&format!(
-                    "[keys] refill added={} + published {}",
-                    added,
-                    keys.status_line()
-                ));
-                Ok(true)
-            }
-            UserCommand::KeyRevoke => {
-                keys.revoke_and_regenerate()?;
-                self.session_store
-                    .reset_for_local_identity(keys.identity_public_ed25519())?;
-                self.pending_resume_peer_ik = None;
-                self.resume_recovery_requested = false;
-                self.publish_prekeys(ws_writer, keys).await?;
-                if self.state.active_session {
-                    self.abort_handshake_session(ws_writer).await?;
-                }
-                ui.print_line(&format!(
-                    "[keys] identity revoked/regenerated + published {}",
-                    keys.status_line()
-                ));
                 Ok(true)
             }
             UserCommand::Quit => {
@@ -217,23 +167,12 @@ impl ClientRuntime {
                 ui.print_line("Bye");
                 Ok(false)
             }
-            UserCommand::CreateInvite => {
-                self.pending_invite_copy_request_id = None;
-                let _ = self
-                    .request_invite(ws_writer, keys, invite_relay, invite_ttl)
-                    .await?;
-                Ok(true)
-            }
             UserCommand::CreateInviteAndCopy => {
                 let request_id = self
                     .request_invite(ws_writer, keys, invite_relay, invite_ttl)
                     .await?;
                 self.pending_invite_copy_request_id = Some(request_id);
                 ui.print_line("[invite] creating invite; will copy to clipboard on receive");
-                Ok(true)
-            }
-            UserCommand::CopyLastInvite => {
-                self.copy_last_invite_or_print(ui);
                 Ok(true)
             }
             UserCommand::ConnectInvite(invite) => {
@@ -263,58 +202,6 @@ impl ClientRuntime {
                 self.print_trust_status(ui);
                 Ok(true)
             }
-            UserCommand::TrustVerify => {
-                self.verify_or_accept_active_peer(false, ui)?;
-                Ok(true)
-            }
-            UserCommand::TrustUnverify => {
-                let Some(active) = self.active_peer_trust.as_ref() else {
-                    ui.print_line(
-                        "[trust] no active secure peer; establish session first, then /trust unverify",
-                    );
-                    return Ok(true);
-                };
-
-                self.trust.unverify_peer(&active.peer_ik_ed25519)?;
-                self.session_store.remove_peer(&active.peer_ik_ed25519)?;
-                let refreshed = self.trust.evaluate_peer(&active.peer_ik_ed25519)?;
-                self.active_peer_trust = Some(refreshed.clone());
-                ui.print_line(&format!(
-                    "[trust] unverified peer fp={} safety={}",
-                    refreshed.fingerprint_short, refreshed.safety_number
-                ));
-                Ok(true)
-            }
-            UserCommand::TrustList => {
-                let verified = self.trust.list_verified();
-                if verified.is_empty() {
-                    ui.print_line("[trust] verified contacts: none");
-                    return Ok(true);
-                }
-                ui.print_line(&format!("[trust] verified contacts: {}", verified.len()));
-                for entry in verified {
-                    ui.print_line(&format!(
-                        "[trust] fp={} safety={}",
-                        entry.fingerprint_short, entry.safety_number
-                    ));
-                }
-                Ok(true)
-            }
-            UserCommand::LoginStatus => {
-                let local_fp = keys.status().fingerprint_short;
-                if let Some(login) = self.local_login.as_ref() {
-                    ui.print_line(&format!(
-                        "[login] local {} fp={}",
-                        format_login(login),
-                        local_fp
-                    ));
-                } else {
-                    ui.print_line(&format!("[login] local unbound fp={local_fp}"));
-                }
-                self.request_login_lookup_by_ik(ws_writer, keys.identity_public_ed25519(), true)
-                    .await?;
-                Ok(true)
-            }
             UserCommand::SetUsername(raw_login) => {
                 let Some(login) = self.normalize_login_or_print_error(&raw_login, ui) else {
                     return Ok(true);
@@ -324,15 +211,6 @@ impl ClientRuntime {
             }
             UserCommand::AcceptKey => {
                 self.verify_or_accept_active_peer(true, ui)?;
-                Ok(true)
-            }
-            UserCommand::LoginLookup(raw_login) => {
-                let Some(login) = self.normalize_login_or_print_error(&raw_login, ui) else {
-                    return Ok(true);
-                };
-                self.request_login_lookup_by_login(ws_writer, &login)
-                    .await?;
-                ui.print_line(&format!("[login] resolving {} ...", format_login(&login)));
                 Ok(true)
             }
             UserCommand::SendMessage(text) => {
@@ -404,7 +282,6 @@ impl ClientRuntime {
     ) -> Result<(), Box<dyn Error>> {
         match action {
             WireAction::InviteCreated { request_id, invite } => {
-                self.last_invite_code = Some(invite.clone());
                 if self.pending_invite_copy_request_id.as_deref() == request_id.as_deref() {
                     self.pending_invite_copy_request_id = None;
                     self.copy_invite_or_print(ui, &invite);
@@ -642,25 +519,6 @@ impl ClientRuntime {
         let _ = self
             .send_request(ws_writer, events::names::E2E_PREKEY_PUBLISH, payload)
             .await?;
-        Ok(())
-    }
-
-    async fn request_login_lookup_by_login(
-        &mut self,
-        ws_writer: &mut WsWriter,
-        login: &str,
-    ) -> Result<(), Box<dyn Error>> {
-        let request_id = self
-            .send_request(
-                ws_writer,
-                events::names::LOGIN_LOOKUP,
-                LoginLookupRequest {
-                    login: Some(login.to_string()),
-                    ik_ed25519: None,
-                },
-            )
-            .await?;
-        self.pending_named_login_lookup.insert(request_id);
         Ok(())
     }
 
@@ -983,7 +841,6 @@ impl ClientRuntime {
         if let Some(request_id) = request_id {
             self.pending_local_login_lookup.remove(&request_id);
             self.pending_peer_login_lookup.remove(&request_id);
-            self.pending_named_login_lookup.remove(&request_id);
         }
 
         let fp = fingerprint_short_for_ik(&ik_ed25519);
@@ -1041,13 +898,6 @@ impl ClientRuntime {
         {
             self.awaiting_username_entry = true;
             self.print_username_prompt(ui);
-            return;
-        }
-
-        if self.pending_named_login_lookup.remove(&request_id)
-            && event.code == ErrorCode::LoginNotFound
-        {
-            ui.print_line("[login] username not found");
             return;
         }
 
@@ -1111,20 +961,12 @@ impl ClientRuntime {
         Some(login)
     }
 
-    fn copy_last_invite_or_print(&self, ui: &mut TerminalUi) {
-        let Some(invite) = self.last_invite_code.as_deref() else {
-            ui.print_line("[invite] no invite available yet; run /my invite copy first");
-            return;
-        };
-        self.copy_invite_or_print(ui, invite);
-    }
-
     fn copy_invite_or_print(&self, ui: &mut TerminalUi, invite: &str) {
         match ui.copy_to_clipboard(invite) {
             Ok(()) => ui.print_line("[invite] copied to clipboard"),
             Err(err) => {
                 ui.print_error(&format!(
-                    "[invite] clipboard copy failed: {err}; use /copy again or widen terminal"
+                    "[invite] clipboard copy failed: {err}; retry /my invite copy"
                 ));
             }
         }
