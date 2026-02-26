@@ -71,6 +71,43 @@ pub(super) fn compact_history_row(line: &ChatLine, width: usize) -> String {
     )
 }
 
+pub(super) fn wrap_chars(input: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    if input.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut count = 0usize;
+
+    for ch in input.chars() {
+        if ch == '\n' {
+            out.push(std::mem::take(&mut current));
+            count = 0;
+            continue;
+        }
+
+        current.push(ch);
+        count += 1;
+
+        if count >= width {
+            out.push(std::mem::take(&mut current));
+            count = 0;
+        }
+    }
+
+    if !current.is_empty() {
+        out.push(current);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +123,17 @@ mod tests {
         assert_eq!(truncate_with_marker("abcdef", 5), "ab...");
         assert_eq!(truncate_with_marker("abc", 5), "abc");
         assert_eq!(truncate_with_marker("abcdef", 2), "..");
+    }
+
+    #[test]
+    fn wrap_chars_splits_long_lines_by_width() {
+        assert_eq!(
+            wrap_chars("ABCDEFGHIJ", 4),
+            vec!["ABCD".to_string(), "EFGH".to_string(), "IJ".to_string()]
+        );
+        assert_eq!(
+            wrap_chars("ab\ncd", 8),
+            vec!["ab".to_string(), "cd".to_string()]
+        );
     }
 }

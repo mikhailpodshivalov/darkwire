@@ -2,6 +2,9 @@ use crossterm::style::Color;
 
 pub(super) fn sender_color(sender: &str) -> Option<Color> {
     let normalized = sender.trim().trim_start_matches('@').to_ascii_lowercase();
+    if normalized.starts_with("fp:") {
+        return Some(Color::White);
+    }
     match normalized.as_str() {
         "mike" => Some(Color::Green),
         "yura" => Some(Color::Blue),

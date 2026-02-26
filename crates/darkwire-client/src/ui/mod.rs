@@ -230,7 +230,7 @@ impl TerminalUi {
         if let Some((sender, _)) = line_parse::parse_sender_line(line) {
             let sender = line_parse::normalize_sender(&sender);
             if !line_parse::is_outgoing_sender(&sender) {
-                self.active_peer = Some(sender);
+                self.active_peer = Some(normalize_peer_display_name(&sender));
             }
         }
     }
@@ -247,7 +247,7 @@ impl TerminalUi {
             };
             ChatLine {
                 timestamp,
-                sender,
+                sender: normalize_peer_display_name(&sender),
                 text: text.to_string(),
                 kind,
             }
@@ -284,6 +284,14 @@ impl TerminalUi {
         }
         self.history.push_back(entry);
     }
+}
+
+fn normalize_peer_display_name(sender: &str) -> String {
+    let trimmed = sender.trim();
+    if trimmed.starts_with("fp:") {
+        return "peer".to_string();
+    }
+    trimmed.to_string()
 }
 
 pub struct RawModeGuard;
@@ -409,5 +417,11 @@ mod tests {
         let _ = ui.handle_key_event(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
         let submitted = ui.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(submitted.as_deref(), Some("/c X"));
+    }
+
+    #[test]
+    fn normalize_peer_display_name_hides_fingerprint_label() {
+        assert_eq!(normalize_peer_display_name("fp:123456"), "peer");
+        assert_eq!(normalize_peer_display_name("@mike"), "@mike");
     }
 }
