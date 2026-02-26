@@ -147,6 +147,7 @@ pub async fn handle_wire_action(
             }
         }
         WireAction::EncryptedMessage(_)
+        | WireAction::InviteCreated { .. }
         | WireAction::LoginBound { .. }
         | WireAction::LoginBinding { .. }
         | WireAction::Error { .. } => {}

@@ -44,6 +44,8 @@ pub struct ClientRuntime {
     peer_login_missing_notified: bool,
     last_peer_login_lookup_unix: u64,
     awaiting_username_entry: bool,
+    last_invite_code: Option<String>,
+    pending_invite_copy_request_id: Option<String>,
     request_counter: u64,
 }
 
@@ -66,6 +68,8 @@ impl ClientRuntime {
             peer_login_missing_notified: false,
             last_peer_login_lookup_unix: 0,
             awaiting_username_entry: false,
+            last_invite_code: None,
+            pending_invite_copy_request_id: None,
             request_counter: 1,
         }
     }
@@ -94,7 +98,8 @@ impl ClientRuntime {
         invite_ttl: u32,
     ) -> Result<(), Box<dyn Error>> {
         self.publish_prekeys(ws_writer, keys).await?;
-        self.request_invite(ws_writer, keys, invite_relay, invite_ttl)
+        let _ = self
+            .request_invite(ws_writer, keys, invite_relay, invite_ttl)
             .await?;
         self.request_login_lookup_by_ik(ws_writer, keys.identity_public_ed25519(), true)
             .await?;
@@ -213,8 +218,22 @@ impl ClientRuntime {
                 Ok(false)
             }
             UserCommand::CreateInvite => {
-                self.request_invite(ws_writer, keys, invite_relay, invite_ttl)
+                self.pending_invite_copy_request_id = None;
+                let _ = self
+                    .request_invite(ws_writer, keys, invite_relay, invite_ttl)
                     .await?;
+                Ok(true)
+            }
+            UserCommand::CreateInviteAndCopy => {
+                let request_id = self
+                    .request_invite(ws_writer, keys, invite_relay, invite_ttl)
+                    .await?;
+                self.pending_invite_copy_request_id = Some(request_id);
+                ui.print_line("[invite] creating invite; will copy to clipboard on receive");
+                Ok(true)
+            }
+            UserCommand::CopyLastInvite => {
+                self.copy_last_invite_or_print(ui);
                 Ok(true)
             }
             UserCommand::ConnectInvite(invite) => {
@@ -384,6 +403,13 @@ impl ClientRuntime {
         ui: &mut TerminalUi,
     ) -> Result<(), Box<dyn Error>> {
         match action {
+            WireAction::InviteCreated { request_id, invite } => {
+                self.last_invite_code = Some(invite.clone());
+                if self.pending_invite_copy_request_id.as_deref() == request_id.as_deref() {
+                    self.pending_invite_copy_request_id = None;
+                    self.copy_invite_or_print(ui, &invite);
+                }
+            }
             WireAction::SessionStarted { session_id } => {
                 self.handle_session_started(session_id, ws_writer, keys, ui)
                     .await?;
@@ -593,7 +619,7 @@ impl ClientRuntime {
         keys: &KeyManager,
         invite_relay: &str,
         invite_ttl: u32,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<String, Box<dyn Error>> {
         let payload = InviteCreateRequest {
             r: vec![invite_relay.to_string()],
             e: invite_ttl,
@@ -601,10 +627,10 @@ impl ClientRuntime {
             k: Some(keys.identity_public_ed25519().to_string()),
         };
 
-        let _ = self
+        let request_id = self
             .send_request(ws_writer, events::names::INVITE_CREATE, payload)
             .await?;
-        Ok(())
+        Ok(request_id)
     }
 
     async fn publish_prekeys(
@@ -1005,6 +1031,9 @@ impl ClientRuntime {
         ui: &mut TerminalUi,
     ) {
         let request_id = request_id.unwrap_or_default();
+        if self.pending_invite_copy_request_id.as_deref() == Some(request_id.as_str()) {
+            self.pending_invite_copy_request_id = None;
+        }
 
         if self.pending_local_login_lookup.remove(&request_id)
             && event.code == ErrorCode::LoginNotFound
@@ -1080,6 +1109,25 @@ impl ClientRuntime {
         };
 
         Some(login)
+    }
+
+    fn copy_last_invite_or_print(&self, ui: &mut TerminalUi) {
+        let Some(invite) = self.last_invite_code.as_deref() else {
+            ui.print_line("[invite] no invite available yet; run /new first");
+            return;
+        };
+        self.copy_invite_or_print(ui, invite);
+    }
+
+    fn copy_invite_or_print(&self, ui: &mut TerminalUi, invite: &str) {
+        match ui.copy_to_clipboard(invite) {
+            Ok(()) => ui.print_line("[invite] copied to clipboard"),
+            Err(err) => {
+                ui.print_error(&format!(
+                    "[invite] clipboard copy failed: {err}; use /copy again or widen terminal"
+                ));
+            }
+        }
     }
 
     fn print_username_prompt(&self, ui: &mut TerminalUi) {
