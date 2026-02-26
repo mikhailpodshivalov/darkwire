@@ -5,7 +5,6 @@ use super::{
 use crate::{
     bootstrap::{
         abort_handshake_session as abort_bootstrap_handshake_session, handle_wire_action, now_unix,
-        should_use_initiator_branch,
     },
     keys::{HandshakeRole, KeyManager},
     ui::TerminalUi,
@@ -23,7 +22,6 @@ pub(super) async fn handle_session_started(
 ) -> Result<(), Box<dyn Error>> {
     reset_secure_runtime_state(runtime, false);
     runtime.bootstrap.clear();
-    apply_session_start_handshake_tie_break(runtime, keys, ui);
 
     let resumed = try_auto_resume_on_session_start(runtime, session_id, ws_writer, ui).await?;
     runtime.pending_resume_peer_ik = None;
@@ -167,27 +165,6 @@ pub(super) async fn forward_wire_action(
         &mut runtime.request_counter,
     )
     .await
-}
-
-pub(super) fn apply_session_start_handshake_tie_break(
-    runtime: &mut ClientRuntime,
-    keys: &KeyManager,
-    ui: &mut TerminalUi,
-) {
-    if !runtime.state.should_initiate_handshake {
-        return;
-    }
-
-    let Some(peer_ik) = runtime.pending_resume_peer_ik.as_deref() else {
-        return;
-    };
-
-    if should_use_initiator_branch(keys.identity_public_ed25519(), peer_ik) {
-        return;
-    }
-
-    runtime.state.should_initiate_handshake = false;
-    ui.print_line("[e2e] simultaneous connect resolved: waiting for peer handshake.init");
 }
 
 pub(super) async fn enter_fail_closed_recovery(
