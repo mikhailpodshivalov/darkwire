@@ -41,6 +41,8 @@ pub struct ClientRuntime {
     pending_local_login_lookup: HashSet<String>,
     pending_peer_login_lookup: HashSet<String>,
     pending_named_login_lookup: HashSet<String>,
+    peer_login_missing_notified: bool,
+    last_peer_login_lookup_unix: u64,
     awaiting_username_entry: bool,
     request_counter: u64,
 }
@@ -61,6 +63,8 @@ impl ClientRuntime {
             pending_local_login_lookup: HashSet::new(),
             pending_peer_login_lookup: HashSet::new(),
             pending_named_login_lookup: HashSet::new(),
+            peer_login_missing_notified: false,
+            last_peer_login_lookup_unix: 0,
             awaiting_username_entry: false,
             request_counter: 1,
         }
@@ -463,6 +467,7 @@ impl ClientRuntime {
             Ok(message) => {
                 self.print_incoming_message(ui, &message);
                 self.persist_active_session_checkpoint()?;
+                self.maybe_refresh_active_peer_login(ws_writer).await?;
             }
             Err(err) => ui.print_error(&format!("[e2e] drop inbound message: {err}")),
         }
@@ -545,6 +550,8 @@ impl ClientRuntime {
         self.active_peer_trust = None;
         self.active_peer_login = None;
         self.resume_recovery_requested = false;
+        self.peer_login_missing_notified = false;
+        self.last_peer_login_lookup_unix = 0;
         if clear_pending_resume_peer {
             self.pending_resume_peer_ik = None;
         }
@@ -555,6 +562,8 @@ impl ClientRuntime {
         ws_writer: &mut WsWriter,
         ui: &mut TerminalUi,
     ) -> Result<(), Box<dyn Error>> {
+        self.maybe_refresh_active_peer_login(ws_writer).await?;
+
         if let Some(message) = self.bootstrap.handshake_timeout_message(now_unix()) {
             ui.print_error(&message);
             self.abort_handshake_session(ws_writer).await?;
@@ -649,6 +658,7 @@ impl ClientRuntime {
             self.pending_local_login_lookup.insert(request_id);
         } else {
             self.pending_peer_login_lookup.insert(request_id);
+            self.last_peer_login_lookup_unix = now_unix();
         }
         Ok(())
     }
@@ -858,6 +868,32 @@ impl ClientRuntime {
         Ok(())
     }
 
+    async fn maybe_refresh_active_peer_login(
+        &mut self,
+        ws_writer: &mut WsWriter,
+    ) -> Result<(), Box<dyn Error>> {
+        if !self.state.active_session || self.active_peer_login.is_some() {
+            return Ok(());
+        }
+        if !self.pending_peer_login_lookup.is_empty() {
+            return Ok(());
+        }
+
+        let Some(active) = self.active_peer_trust.as_ref() else {
+            return Ok(());
+        };
+
+        let now = now_unix();
+        if now.saturating_sub(self.last_peer_login_lookup_unix) < 10 {
+            return Ok(());
+        }
+
+        let peer_ik = active.peer_ik_ed25519.clone();
+        self.request_login_lookup_by_ik(ws_writer, &peer_ik, false)
+            .await?;
+        Ok(())
+    }
+
     fn verify_or_accept_active_peer(
         &mut self,
         require_key_changed: bool,
@@ -907,10 +943,6 @@ impl ClientRuntime {
             return format!("{}>", format_login(login));
         }
 
-        if let Some(active) = self.active_peer_trust.as_ref() {
-            return format!("fp:{}>", active.fingerprint_short);
-        }
-
         "peer>".to_string()
     }
 
@@ -937,6 +969,7 @@ impl ClientRuntime {
             if active.peer_ik_ed25519 == ik_ed25519 {
                 is_active_peer = true;
                 self.active_peer_login = Some(login.clone());
+                self.peer_login_missing_notified = false;
                 self.print_active_trust(ui, &active);
                 if active.state == SessionTrustState::KeyChanged {
                     let previous = active
@@ -992,7 +1025,10 @@ impl ClientRuntime {
         if self.pending_peer_login_lookup.remove(&request_id)
             && event.code == ErrorCode::LoginNotFound
         {
-            ui.print_line("[login] peer has no username yet");
+            if !self.peer_login_missing_notified {
+                ui.print_line("[login] peer has no username yet");
+                self.peer_login_missing_notified = true;
+            }
             return;
         }
 

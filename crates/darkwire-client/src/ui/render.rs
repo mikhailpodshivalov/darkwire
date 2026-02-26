@@ -172,9 +172,10 @@ impl TerminalUi {
         let history_rows = height.saturating_sub(menu_rows);
 
         let mut y = start_y;
-
-        let lines: Vec<&ChatLine> = self
-            .history
+        let sender_width = sender_width_for_inner(inner);
+        let body_width = body_width_for_inner(inner);
+        let expanded = expanded_history_lines(&self.history, body_width);
+        let lines: Vec<&ChatLine> = expanded
             .iter()
             .rev()
             .take(history_rows)
@@ -183,8 +184,8 @@ impl TerminalUi {
             .rev()
             .collect();
 
-        for line in &lines {
-            self.draw_history_row(stdout, y as u16, inner, line);
+        for line in lines {
+            self.draw_history_row(stdout, y as u16, inner, sender_width, line);
             y += 1;
         }
 
@@ -211,14 +212,17 @@ impl TerminalUi {
         }
     }
 
-    fn draw_history_row(&self, stdout: &mut io::Stdout, y: u16, inner: usize, line: &ChatLine) {
+    fn draw_history_row(
+        &self,
+        stdout: &mut io::Stdout,
+        y: u16,
+        inner: usize,
+        sender_width: usize,
+        line: &ChatLine,
+    ) {
         let _ = queue!(stdout, MoveTo(0, y), Print("║"));
 
         // Row shape: " HH:MM sender: message"
-        let fixed_cells_without_sender = 1 + 5 + 1 + 2;
-        let min_body_width = 8;
-        let max_sender = inner.saturating_sub(fixed_cells_without_sender + min_body_width);
-        let sender_width = max_sender.clamp(6, 16);
         let header_width = 1 + 5 + 1 + sender_width + 2;
         let body_width = inner.saturating_sub(header_width);
 
@@ -226,7 +230,11 @@ impl TerminalUi {
         let _ = queue!(stdout, Print(" "));
         used += 1;
 
-        let time = text::pad_or_trim(&line.timestamp, 5);
+        let time = if line.timestamp.is_empty() {
+            " ".repeat(5)
+        } else {
+            text::pad_or_trim(&line.timestamp, 5)
+        };
         let _ = queue!(
             stdout,
             SetForegroundColor(Color::DarkGrey),
@@ -238,34 +246,37 @@ impl TerminalUi {
         let _ = queue!(stdout, Print(" "));
         used += 1;
 
-        let sender = text::pad_or_trim(
-            &truncate_with_marker(&line.sender, sender_width),
-            sender_width,
-        );
-        match line.kind {
-            ChatLineKind::System => {
-                if let Some(color) = style::sender_color(&line.sender) {
-                    let _ = queue!(stdout, SetForegroundColor(color));
-                } else {
-                    let _ = queue!(stdout, SetForegroundColor(Color::DarkGrey));
+        if line.sender.is_empty() {
+            let _ = queue!(stdout, Print(" ".repeat(sender_width)));
+        } else {
+            let sender = text::pad_or_trim(
+                &truncate_with_marker(&line.sender, sender_width),
+                sender_width,
+            );
+            match line.kind {
+                ChatLineKind::System => {
+                    if let Some(color) = style::sender_color(&line.sender) {
+                        let _ = queue!(stdout, SetForegroundColor(color));
+                    } else {
+                        let _ = queue!(stdout, SetForegroundColor(Color::DarkGrey));
+                    }
+                }
+                ChatLineKind::Error => {
+                    let _ = queue!(stdout, SetForegroundColor(Color::Red));
+                }
+                _ => {
+                    if let Some(color) = style::sender_color(&line.sender) {
+                        let _ = queue!(stdout, SetForegroundColor(color));
+                    }
                 }
             }
-            ChatLineKind::Error => {
-                let _ = queue!(stdout, SetForegroundColor(Color::Red));
-            }
-            _ => {
-                if let Some(color) = style::sender_color(&line.sender) {
-                    let _ = queue!(stdout, SetForegroundColor(color));
-                }
-            }
+            let _ = queue!(stdout, Print(sender), ResetColor);
         }
-        let _ = queue!(stdout, Print(sender), ResetColor);
         used += sender_width;
 
         let _ = queue!(stdout, Print(": "));
         used += 2;
-
-        let body = truncate_with_marker(&line.text, body_width);
+        let body = truncate_chars(&line.text, body_width);
         match line.kind {
             ChatLineKind::Error => {
                 let _ = queue!(
@@ -367,6 +378,46 @@ fn terminal_size() -> (usize, usize) {
         .unwrap_or((80, 24))
 }
 
+fn sender_width_for_inner(inner: usize) -> usize {
+    let fixed_cells_without_sender = 1 + 5 + 1 + 2;
+    let min_body_width = 8;
+    let max_sender = inner.saturating_sub(fixed_cells_without_sender + min_body_width);
+    max_sender.clamp(6, 16)
+}
+
+fn body_width_for_inner(inner: usize) -> usize {
+    let sender_width = sender_width_for_inner(inner);
+    let header_width = 1 + 5 + 1 + sender_width + 2;
+    inner.saturating_sub(header_width).max(1)
+}
+
+fn expanded_history_lines(
+    history: &std::collections::VecDeque<ChatLine>,
+    body_width: usize,
+) -> Vec<ChatLine> {
+    let mut out = Vec::new();
+    for line in history {
+        let chunks = text::wrap_chars(&line.text, body_width);
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            out.push(ChatLine {
+                timestamp: if idx == 0 {
+                    line.timestamp.clone()
+                } else {
+                    String::new()
+                },
+                sender: if idx == 0 {
+                    line.sender.clone()
+                } else {
+                    String::new()
+                },
+                text: chunk,
+                kind: line.kind,
+            });
+        }
+    }
+    out
+}
+
 pub(super) fn command_menu_window(
     total: usize,
     selected: usize,
@@ -399,5 +450,23 @@ mod tests {
         let (start, end) = command_menu_window(10, 8, 4);
         assert!(8 >= start && 8 < end);
         assert_eq!(end - start, 4);
+    }
+
+    #[test]
+    fn expanded_history_lines_wraps_long_payload_into_multiple_rows() {
+        let mut history = std::collections::VecDeque::new();
+        history.push_back(ChatLine {
+            timestamp: "12:00".to_string(),
+            sender: "invite".to_string(),
+            text: "DL1:ABCDEFGHIJ".to_string(),
+            kind: ChatLineKind::System,
+        });
+
+        let expanded = expanded_history_lines(&history, 4);
+        assert_eq!(expanded.len(), 4);
+        assert_eq!(expanded[0].timestamp, "12:00");
+        assert_eq!(expanded[0].sender, "invite");
+        assert!(expanded[1].timestamp.is_empty());
+        assert!(expanded[1].sender.is_empty());
     }
 }
