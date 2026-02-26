@@ -16,7 +16,9 @@ pub struct ClientState {
 
 #[derive(Debug, Clone)]
 pub enum WireAction {
-    SessionStarted { session_id: Uuid },
+    SessionStarted {
+        session_id: Uuid,
+    },
     SessionEnded,
     PrekeyBundle(PrekeyBundleEvent),
     HandshakeInitRecv(HandshakeInitRequest),

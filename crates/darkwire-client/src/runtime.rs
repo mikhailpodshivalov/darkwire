@@ -8,8 +8,8 @@ use crate::{
     wire::{extract_wire_action, handle_server_text, ClientState, WireAction},
 };
 use darkwire_protocol::events::{
-    self, Envelope, ErrorCode, ErrorEvent, InviteCreateRequest, InviteUseRequest,
-    LoginBindRequest, LoginLookupRequest, SessionLeaveRequest,
+    self, Envelope, ErrorCode, ErrorEvent, InviteCreateRequest, InviteUseRequest, LoginBindRequest,
+    LoginLookupRequest, SessionLeaveRequest,
 };
 use darkwire_protocol::login::{format_login, normalize_login};
 use futures_util::{stream::SplitSink, SinkExt};
@@ -158,11 +158,11 @@ impl ClientRuntime {
                 if self.state.active_session {
                     let _ = self
                         .send_request(
-                        ws_writer,
-                        events::names::SESSION_LEAVE,
-                        SessionLeaveRequest::default(),
-                    )
-                    .await?;
+                            ws_writer,
+                            events::names::SESSION_LEAVE,
+                            SessionLeaveRequest::default(),
+                        )
+                        .await?;
                 }
                 ui.print_line("Bye");
                 Ok(false)
@@ -175,11 +175,11 @@ impl ClientRuntime {
             UserCommand::ConnectInvite(invite) => {
                 let _ = self
                     .send_request(
-                    ws_writer,
-                    events::names::INVITE_USE,
-                    InviteUseRequest { invite },
-                )
-                .await?;
+                        ws_writer,
+                        events::names::INVITE_USE,
+                        InviteUseRequest { invite },
+                    )
+                    .await?;
                 Ok(true)
             }
             UserCommand::TrustStatus => {
@@ -187,20 +187,7 @@ impl ClientRuntime {
                 Ok(true)
             }
             UserCommand::TrustVerify => {
-                let Some(active) = self.active_peer_trust.as_ref() else {
-                    ui.print_line(
-                        "[trust] no active secure peer; establish session first, then /trust verify",
-                    );
-                    return Ok(true);
-                };
-
-                self.trust.verify_peer(&active.peer_ik_ed25519)?;
-                let refreshed = self.trust.evaluate_peer(&active.peer_ik_ed25519)?;
-                self.active_peer_trust = Some(refreshed.clone());
-                ui.print_line(&format!(
-                    "[trust] verified peer fp={} safety={}",
-                    refreshed.fingerprint_short, refreshed.safety_number
-                ));
+                self.verify_or_accept_active_peer(false, ui)?;
                 Ok(true)
             }
             UserCommand::TrustUnverify => {
@@ -250,7 +237,7 @@ impl ClientRuntime {
                     .await?;
                 Ok(true)
             }
-            UserCommand::LoginSet(raw_login) => {
+            UserCommand::SetUsername(raw_login) => {
                 let Some(login) = normalize_login(&raw_login) else {
                     ui.print_error(
                         "[login] invalid login format; use 3-24 chars [a-z0-9_.-], optional @ prefix",
@@ -258,6 +245,10 @@ impl ClientRuntime {
                     return Ok(true);
                 };
                 self.bind_local_login(ws_writer, keys, &login, ui).await?;
+                Ok(true)
+            }
+            UserCommand::AcceptKey => {
+                self.verify_or_accept_active_peer(true, ui)?;
                 Ok(true)
             }
             UserCommand::LoginLookup(raw_login) => {
@@ -280,6 +271,16 @@ impl ClientRuntime {
                 if !self.state.secure_active {
                     ui.print_line(
                         "Secure handshake is in progress. Wait for '[e2e] secure session established'.",
+                    );
+                    return Ok(true);
+                }
+                if self
+                    .active_peer_trust
+                    .as_ref()
+                    .is_some_and(|trust| trust.state == SessionTrustState::KeyChanged)
+                {
+                    ui.print_error(
+                        "[trust] peer key changed; use /accept-key before sending messages",
                     );
                     return Ok(true);
                 }
@@ -319,7 +320,10 @@ impl ClientRuntime {
         match action {
             WireAction::EncryptedMessage(event) => {
                 match self.secure_messenger.decrypt_incoming(&event) {
-                    Ok(message) => ui.print_line(&format!("peer> {message}")),
+                    Ok(message) => {
+                        let sender_label = self.incoming_sender_label();
+                        ui.print_line(&format!("{sender_label} {message}"));
+                    }
                     Err(err) => ui.print_error(&format!("[e2e] drop inbound message: {err}")),
                 }
             }
@@ -367,12 +371,16 @@ impl ClientRuntime {
                                 .as_deref()
                                 .unwrap_or("unknown");
                             ui.print_error(&format!(
-                                "[trust] WARNING: peer identity key changed (prev_fp={previous} new_fp={}); re-verify with /trust verify",
+                                "[trust] WARNING: peer identity key changed (prev_fp={previous} new_fp={}); use /accept-key to continue",
                                 trust.fingerprint_short
                             ));
                         }
-                        self.request_login_lookup_by_ik(ws_writer, &material.peer_ik_ed25519, false)
-                            .await?;
+                        self.request_login_lookup_by_ik(
+                            ws_writer,
+                            &material.peer_ik_ed25519,
+                            false,
+                        )
+                        .await?;
                         self.active_peer_trust = Some(trust);
                     }
                 }
@@ -449,14 +457,14 @@ impl ClientRuntime {
     ) -> Result<(), Box<dyn Error>> {
         let request_id = self
             .send_request(
-            ws_writer,
-            events::names::LOGIN_LOOKUP,
-            LoginLookupRequest {
-                login: Some(login.to_string()),
-                ik_ed25519: None,
-            },
-        )
-        .await?;
+                ws_writer,
+                events::names::LOGIN_LOOKUP,
+                LoginLookupRequest {
+                    login: Some(login.to_string()),
+                    ik_ed25519: None,
+                },
+            )
+            .await?;
         self.pending_named_login_lookup.insert(request_id);
         Ok(())
     }
@@ -469,14 +477,14 @@ impl ClientRuntime {
     ) -> Result<(), Box<dyn Error>> {
         let request_id = self
             .send_request(
-            ws_writer,
-            events::names::LOGIN_LOOKUP,
-            LoginLookupRequest {
-                login: None,
-                ik_ed25519: Some(ik_ed25519.to_string()),
-            },
-        )
-        .await?;
+                ws_writer,
+                events::names::LOGIN_LOOKUP,
+                LoginLookupRequest {
+                    login: None,
+                    ik_ed25519: Some(ik_ed25519.to_string()),
+                },
+            )
+            .await?;
         if is_local {
             self.pending_local_login_lookup.insert(request_id);
         } else {
@@ -511,6 +519,35 @@ impl ClientRuntime {
         }
     }
 
+    fn verify_or_accept_active_peer(
+        &mut self,
+        require_key_changed: bool,
+        ui: &mut TerminalUi,
+    ) -> Result<(), Box<dyn Error>> {
+        let Some(active) = self.active_peer_trust.as_ref() else {
+            ui.print_line("[trust] no active secure peer");
+            return Ok(());
+        };
+
+        if require_key_changed && active.state != SessionTrustState::KeyChanged {
+            ui.print_line("[trust] no pending key change");
+            return Ok(());
+        }
+
+        self.trust.verify_peer(&active.peer_ik_ed25519)?;
+        let refreshed = self.trust.evaluate_peer(&active.peer_ik_ed25519)?;
+        self.active_peer_trust = Some(refreshed.clone());
+        self.print_active_trust(ui, &refreshed);
+
+        if require_key_changed {
+            ui.print_line("[trust] key change accepted");
+        } else {
+            ui.print_line("[trust] peer verified");
+        }
+
+        Ok(())
+    }
+
     fn print_active_trust(&self, ui: &mut TerminalUi, active: &ActivePeerTrust) {
         let login = self
             .active_peer_login
@@ -524,6 +561,18 @@ impl ClientRuntime {
             active.fingerprint_short,
             active.safety_number
         ));
+    }
+
+    fn incoming_sender_label(&self) -> String {
+        if let Some(login) = self.active_peer_login.as_ref() {
+            return format!("{}>", format_login(login));
+        }
+
+        if let Some(active) = self.active_peer_trust.as_ref() {
+            return format!("fp:{}>", active.fingerprint_short);
+        }
+
+        "peer>".to_string()
     }
 
     fn handle_login_binding(
@@ -556,7 +605,7 @@ impl ClientRuntime {
                         .as_deref()
                         .unwrap_or("unknown");
                     ui.print_error(&format!(
-                        "[trust] WARNING: login {formatted} key changed (prev_fp={previous} new_fp={}); re-verify with /trust verify",
+                        "[trust] WARNING: login {formatted} key changed (prev_fp={previous} new_fp={}); use /accept-key to continue",
                         active.fingerprint_short
                     ));
                 }
@@ -592,13 +641,15 @@ impl ClientRuntime {
             return;
         }
 
-        if self.pending_named_login_lookup.remove(&request_id) && event.code == ErrorCode::LoginNotFound
+        if self.pending_named_login_lookup.remove(&request_id)
+            && event.code == ErrorCode::LoginNotFound
         {
             ui.print_line("[login] username not found");
             return;
         }
 
-        if self.pending_peer_login_lookup.remove(&request_id) && event.code == ErrorCode::LoginNotFound
+        if self.pending_peer_login_lookup.remove(&request_id)
+            && event.code == ErrorCode::LoginNotFound
         {
             ui.print_line("[login] peer has no username yet");
             return;
@@ -607,13 +658,11 @@ impl ClientRuntime {
         match event.code {
             ErrorCode::LoginTaken => ui.print_error("[login] this username is already taken"),
             ErrorCode::LoginInvalid => {
-                ui.print_error("[login] invalid username/signature; use /login set @name")
+                ui.print_error("[login] invalid username/signature; use /me @name")
             }
-            ErrorCode::LoginKeyMismatch => {
-                ui.print_error(
-                    "[login] signature or identity mismatch; run /keys and retry /login set @name",
-                )
-            }
+            ErrorCode::LoginKeyMismatch => ui.print_error(
+                "[login] signature or identity mismatch; run /keys and retry /me @name",
+            ),
             ErrorCode::LoginNotFound => ui.print_line("[login] username not found"),
             _ => {}
         }

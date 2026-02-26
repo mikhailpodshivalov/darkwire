@@ -4,6 +4,8 @@ pub enum UserCommand {
     HelpAll,
     CreateInvite,
     ConnectInvite(String),
+    SetUsername(String),
+    AcceptKey,
     KeyStatus,
     KeyRotate,
     KeyRefill,
@@ -13,7 +15,6 @@ pub enum UserCommand {
     TrustUnverify,
     TrustList,
     LoginStatus,
-    LoginSet(String),
     LoginLookup(String),
     Quit,
     SendMessage(String),
@@ -49,6 +50,27 @@ pub fn parse_user_command(line: &str) -> UserCommand {
 
     if trimmed == "/q" {
         return UserCommand::Quit;
+    }
+
+    if trimmed == "/accept-key" {
+        return UserCommand::AcceptKey;
+    }
+
+    if trimmed.starts_with("/me") {
+        let mut parts = trimmed.split_whitespace();
+        let command = parts.next();
+        let username = parts.next();
+        let extra = parts.next();
+
+        if command == Some("/me") && extra.is_none() {
+            if let Some(username) = username {
+                return UserCommand::SetUsername(username.to_string());
+            }
+        }
+
+        if trimmed.starts_with("/me@") && trimmed.len() > 4 {
+            return UserCommand::SetUsername(format!("@{}", &trimmed[4..]));
+        }
     }
 
     if trimmed == "/keys" {
@@ -94,13 +116,13 @@ pub fn parse_user_command(line: &str) -> UserCommand {
             match (action, value) {
                 (None, None) => return UserCommand::LoginStatus,
                 (Some("set"), Some(login)) => {
-                    return UserCommand::LoginSet(login.to_string());
+                    return UserCommand::SetUsername(login.to_string());
                 }
                 (Some("lookup"), Some(login)) => {
                     return UserCommand::LoginLookup(login.to_string());
                 }
                 (Some(compact), None) if compact.starts_with("set@") && compact.len() > 4 => {
-                    return UserCommand::LoginSet(format!("@{}", &compact[4..]));
+                    return UserCommand::SetUsername(format!("@{}", &compact[4..]));
                 }
                 (Some(compact), None) if compact.starts_with("lookup@") && compact.len() > 7 => {
                     return UserCommand::LoginLookup(format!("@{}", &compact[7..]));
@@ -136,6 +158,8 @@ pub fn command_help_basic_lines() -> &'static [&'static str] {
         "/help all - show full command list",
         "/new (/i) - create new invite",
         "/c CODE - connect by invite code",
+        "/me @name - set or change your username",
+        "/accept-key - accept peer key change and continue",
         "/q - quit",
         "<text> - send encrypted message in active secure session",
     ]
@@ -147,6 +171,8 @@ pub fn command_help_all_lines() -> &'static [&'static str] {
         "/help all - show full command list",
         "/new (/i) - create new invite",
         "/c CODE - connect by invite code",
+        "/me @name - set or change your username",
+        "/accept-key - accept peer key change and continue",
         "/keys - show local key status",
         "/keys rotate - rotate signed prekey",
         "/keys refill - refill one-time prekeys",
@@ -234,6 +260,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_command_set_username() {
+        assert_eq!(
+            parse_user_command("/me @mike"),
+            UserCommand::SetUsername("@mike".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_command_set_username_compact() {
+        assert_eq!(
+            parse_user_command("/me@mike"),
+            UserCommand::SetUsername("@mike".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_command_accept_key() {
+        assert_eq!(parse_user_command("/accept-key"), UserCommand::AcceptKey);
+    }
+
+    #[test]
     fn parse_command_trust_status() {
         assert_eq!(parse_user_command("/trust"), UserCommand::TrustStatus);
     }
@@ -268,7 +315,7 @@ mod tests {
     fn parse_command_login_set() {
         assert_eq!(
             parse_user_command("/login set @mike"),
-            UserCommand::LoginSet("@mike".to_string())
+            UserCommand::SetUsername("@mike".to_string())
         );
     }
 
@@ -284,7 +331,7 @@ mod tests {
     fn parse_command_login_set_compact() {
         assert_eq!(
             parse_user_command("/login set@mike"),
-            UserCommand::LoginSet("@mike".to_string())
+            UserCommand::SetUsername("@mike".to_string())
         );
     }
 
@@ -306,6 +353,8 @@ mod tests {
     #[test]
     fn all_help_lines_include_advanced_commands() {
         let help = command_help_all_lines().join("\n");
+        assert!(help.contains("/me @name"));
+        assert!(help.contains("/accept-key"));
         assert!(help.contains("/keys rotate"));
         assert!(help.contains("/trust verify"));
         assert!(help.contains("/login set @name"));

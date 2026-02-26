@@ -113,6 +113,12 @@ impl TrustManager {
                 // Require explicit re-trust after key change.
                 self.store.verified_peer_ik_ed25519.remove(peer_ik_ed25519);
             }
+        } else if state == SessionTrustState::Unverified {
+            // TOFU: first seen identity key is auto-trusted.
+            self.store
+                .verified_peer_ik_ed25519
+                .insert(peer_ik_ed25519.to_string());
+            state = SessionTrustState::Verified;
         }
 
         self.store.last_seen_peer_ik_ed25519 = Some(peer_ik_ed25519.to_string());
@@ -348,6 +354,23 @@ mod tests {
 
         let after = trust.evaluate_peer(&second).expect("evaluate second again");
         assert_eq!(after.state, SessionTrustState::Unverified);
+
+        let _ = fs::remove_dir_all(
+            trust_file
+                .parent()
+                .expect("temp trust file should have a parent"),
+        );
+    }
+
+    #[test]
+    fn evaluate_peer_first_seen_is_auto_verified_by_tofu() {
+        let trust_file = temp_trust_file();
+        let mut trust = TrustManager::load_or_init(trust_file.clone()).expect("init trust store");
+        let first = peer_ik(9);
+
+        let first_state = trust.evaluate_peer(&first).expect("evaluate first");
+        assert_eq!(first_state.state, SessionTrustState::Verified);
+        assert_eq!(trust.verified_count(), 1);
 
         let _ = fs::remove_dir_all(
             trust_file
