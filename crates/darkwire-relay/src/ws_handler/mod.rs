@@ -193,12 +193,12 @@ async fn handle_text_message(
     };
 
     let request_id = incoming.request_id;
-    if requires_v2_protocol(&incoming.event_type) && incoming.protocol_version != Some(2) {
+    if let Some(violation) = protocol_violation(&incoming.event_type, incoming.protocol_version) {
         return send_error(
             socket,
             request_id,
-            ErrorCode::UnsupportedProtocol,
-            "unsupported protocol version for e2e event; expected pv=2",
+            violation.code(),
+            violation.message(),
             conn_id,
         )
         .await;
@@ -395,16 +395,6 @@ async fn handle_text_message(
             e2e::handle_encrypted_message(socket, state, conn_id, ip, request_id, incoming.data)
                 .await
         }
-        events::names::MSG_SEND => {
-            send_error(
-                socket,
-                request_id,
-                ErrorCode::E2eRequired,
-                "plaintext messaging disabled; use e2e.msg.send",
-                conn_id,
-            )
-            .await
-        }
         events::names::SESSION_LEAVE => {
             let _: SessionLeaveRequest = match serde_json::from_value(incoming.data) {
                 Ok(request) => request,
@@ -465,6 +455,72 @@ async fn handle_text_message(
     }
 }
 
-fn requires_v2_protocol(event_type: &str) -> bool {
-    event_type.starts_with("e2e.")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolViolation {
+    UnsupportedE2eVersion,
+    PlaintextDisabled,
+}
+
+impl ProtocolViolation {
+    fn code(self) -> ErrorCode {
+        match self {
+            Self::UnsupportedE2eVersion => ErrorCode::UnsupportedProtocol,
+            Self::PlaintextDisabled => ErrorCode::E2eRequired,
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::UnsupportedE2eVersion => {
+                "unsupported protocol version for e2e event; expected pv=2"
+            }
+            Self::PlaintextDisabled => "plaintext messaging disabled; use e2e.msg.send",
+        }
+    }
+}
+
+fn protocol_violation(event_type: &str, protocol_version: Option<u8>) -> Option<ProtocolViolation> {
+    if event_type.starts_with("e2e.") && protocol_version != Some(2) {
+        return Some(ProtocolViolation::UnsupportedE2eVersion);
+    }
+
+    if event_type == events::names::MSG_SEND {
+        return Some(ProtocolViolation::PlaintextDisabled);
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_violation_rejects_e2e_without_v2() {
+        assert_eq!(
+            protocol_violation(events::names::E2E_PREKEY_GET, None),
+            Some(ProtocolViolation::UnsupportedE2eVersion)
+        );
+        assert_eq!(
+            protocol_violation(events::names::E2E_PREKEY_GET, Some(1)),
+            Some(ProtocolViolation::UnsupportedE2eVersion)
+        );
+    }
+
+    #[test]
+    fn protocol_violation_rejects_plaintext_event() {
+        assert_eq!(
+            protocol_violation(events::names::MSG_SEND, Some(2)),
+            Some(ProtocolViolation::PlaintextDisabled)
+        );
+    }
+
+    #[test]
+    fn protocol_violation_accepts_v2_e2e_and_non_e2e_events() {
+        assert_eq!(
+            protocol_violation(events::names::E2E_PREKEY_GET, Some(2)),
+            None
+        );
+        assert_eq!(protocol_violation(events::names::PING, None), None);
+    }
 }
