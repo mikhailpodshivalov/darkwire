@@ -157,6 +157,7 @@ impl KeyManager {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn rotate_signed_prekey(&mut self) -> Result<(), Box<dyn Error>> {
         let now = now_unix();
         self.store.rotate_signed_prekey(now)?;
@@ -165,6 +166,7 @@ impl KeyManager {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn refill_one_time_prekeys(&mut self) -> Result<usize, Box<dyn Error>> {
         let now = now_unix();
         let before = self.store.one_time_prekeys.len();
@@ -177,6 +179,7 @@ impl KeyManager {
         Ok(added)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn revoke_and_regenerate(&mut self) -> Result<(), Box<dyn Error>> {
         let now = now_unix();
         let identity = generate_identity()?;

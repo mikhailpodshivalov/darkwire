@@ -41,6 +41,7 @@ pub struct ActivePeerTrust {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct VerifiedContact {
     pub fingerprint_short: String,
     pub safety_number: String,
@@ -80,6 +81,7 @@ impl TrustManager {
         self.store.verified_peer_ik_ed25519.len()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn list_verified(&self) -> Vec<VerifiedContact> {
         self.store
             .verified_peer_ik_ed25519
