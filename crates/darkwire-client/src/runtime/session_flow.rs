@@ -120,7 +120,7 @@ pub(super) async fn activate_secure_material_if_ready(
 
     let trust = runtime.trust.evaluate_peer(&material.peer_ik_ed25519)?;
     runtime.recovery.reset();
-    runtime.active_peer_login = None;
+    runtime.active_peer_login = runtime.cached_login_for_peer(&material.peer_ik_ed25519);
     runtime.print_active_trust(ui, &trust);
 
     if trust.state == crate::trust::SessionTrustState::KeyChanged {
@@ -309,7 +309,7 @@ pub(super) async fn try_auto_resume_on_session_start(
     runtime.recovery.reset();
 
     let trust = runtime.trust.evaluate_peer(&peer_ik_ed25519)?;
-    runtime.active_peer_login = None;
+    runtime.active_peer_login = runtime.cached_login_for_peer(&peer_ik_ed25519);
     runtime.active_peer_trust = Some(trust.clone());
     runtime.print_active_trust(ui, &trust);
     runtime
@@ -373,7 +373,7 @@ pub(super) async fn try_auto_resume_from_incoming(
         runtime.secure_messenger = resumed;
         runtime.state.secure_active = true;
         runtime.recovery.reset();
-        runtime.active_peer_login = None;
+        runtime.active_peer_login = runtime.cached_login_for_peer(&stored.peer_ik_ed25519);
         runtime.active_peer_trust = Some(trust.clone());
         runtime.print_active_trust(ui, &trust);
         runtime
