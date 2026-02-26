@@ -104,6 +104,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         ui.handle_paste(&text);
                         None
                     }
+                    Event::Resize(_, _) => {
+                        ui.redraw_prompt();
+                        None
+                    }
                     _ => None,
                 };
 

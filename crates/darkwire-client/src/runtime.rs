@@ -346,6 +346,7 @@ impl ClientRuntime {
                     .send_request(ws_writer, events::names::E2E_MSG_SEND, payload)
                     .await?;
                 self.persist_active_session_checkpoint()?;
+                ui.print_line(&format!("you> {}", text));
                 Ok(true)
             }
         }
