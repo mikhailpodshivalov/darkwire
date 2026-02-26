@@ -31,6 +31,7 @@ struct RelayArgs {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    load_dotenv();
     let args = RelayArgs::parse();
     init_tracing(&args.log_filter);
 
@@ -50,6 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     Ok(())
+}
+
+fn load_dotenv() {
+    let _ = dotenvy::dotenv();
 }
 
 fn build_app(state: Arc<AppState>) -> Router {
@@ -84,7 +89,11 @@ mod tests {
         signature::{Ed25519KeyPair, KeyPair},
     };
     use serde::{Deserialize, Serialize};
-    use std::time::Duration;
+    use std::{
+        env,
+        sync::{Mutex, MutexGuard, OnceLock},
+        time::Duration,
+    };
     use tokio::{
         net::TcpStream,
         sync::oneshot,
@@ -93,6 +102,46 @@ mod tests {
     use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
     type WsClient = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock")
+    }
+
+    struct EnvOverrideGuard {
+        previous: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl Drop for EnvOverrideGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.previous.iter().rev() {
+                if let Some(value) = value {
+                    env::set_var(key, value);
+                } else {
+                    env::remove_var(key);
+                }
+            }
+        }
+    }
+
+    fn override_env(values: &[(&'static str, Option<&str>)]) -> EnvOverrideGuard {
+        let mut previous = Vec::with_capacity(values.len());
+        for (key, value) in values {
+            previous.push((*key, env::var(key).ok()));
+            if let Some(value) = value {
+                env::set_var(key, value);
+            } else {
+                env::remove_var(key);
+            }
+        }
+        EnvOverrideGuard { previous }
+    }
+
+    fn clear_relay_env() -> EnvOverrideGuard {
+        override_env(&[("DARKWIRE_RELAY_ADDR", None), ("DARKWIRE_LOG_FILTER", None)])
+    }
 
     #[derive(Debug, Deserialize)]
     struct TestEnvelope {
@@ -106,27 +155,69 @@ mod tests {
 
     #[test]
     fn relay_addr_defaults_when_not_provided() {
+        let _lock = env_lock();
+        let _env = clear_relay_env();
         let addr = RelayArgs::parse_from(["darkwire-relay"]).listen;
         assert_eq!(addr.to_string(), "127.0.0.1:7000");
     }
 
     #[test]
     fn relay_addr_uses_listen_flag() {
+        let _lock = env_lock();
+        let _env = clear_relay_env();
         let addr = RelayArgs::parse_from(["darkwire-relay", "--listen", "127.0.0.1:7011"]).listen;
         assert_eq!(addr.to_string(), "127.0.0.1:7011");
     }
 
     #[test]
     fn relay_log_filter_defaults_when_not_provided() {
+        let _lock = env_lock();
+        let _env = clear_relay_env();
         let filter = RelayArgs::parse_from(["darkwire-relay"]).log_filter;
         assert_eq!(filter, "darkwire_relay=info,tower_http=warn");
     }
 
     #[test]
     fn relay_log_filter_uses_flag_value() {
+        let _lock = env_lock();
+        let _env = clear_relay_env();
         let filter =
             RelayArgs::parse_from(["darkwire-relay", "--log-filter", "debug,axum=warn"]).log_filter;
         assert_eq!(filter, "debug,axum=warn");
+    }
+
+    #[test]
+    fn relay_uses_env_values_when_flags_missing() {
+        let _lock = env_lock();
+        let _clean = clear_relay_env();
+        let _env = override_env(&[
+            ("DARKWIRE_RELAY_ADDR", Some("127.0.0.1:7444")),
+            ("DARKWIRE_LOG_FILTER", Some("info,axum=warn")),
+        ]);
+
+        let args = RelayArgs::parse_from(["darkwire-relay"]);
+        assert_eq!(args.listen.to_string(), "127.0.0.1:7444");
+        assert_eq!(args.log_filter, "info,axum=warn");
+    }
+
+    #[test]
+    fn relay_flags_override_env_values() {
+        let _lock = env_lock();
+        let _clean = clear_relay_env();
+        let _env = override_env(&[
+            ("DARKWIRE_RELAY_ADDR", Some("127.0.0.1:7444")),
+            ("DARKWIRE_LOG_FILTER", Some("info,axum=warn")),
+        ]);
+
+        let args = RelayArgs::parse_from([
+            "darkwire-relay",
+            "--listen",
+            "127.0.0.1:7555",
+            "--log-filter",
+            "debug,axum=error",
+        ]);
+        assert_eq!(args.listen.to_string(), "127.0.0.1:7555");
+        assert_eq!(args.log_filter, "debug,axum=error");
     }
 
     #[tokio::test]

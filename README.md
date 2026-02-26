@@ -145,6 +145,18 @@ Wait for `[e2e] secure session established ...` before sending messages.
 - any other non-empty line sends chat message to active secure session
 
 ## Configuration
+Both `darkwire` and `darkwire-relay` auto-load `.env` from the current working directory on startup.
+
+Precedence order is:
+- CLI flags
+- process environment / `.env`
+- built-in defaults
+
+Start from template:
+```bash
+cp .env.example .env
+```
+
 ### Relay (`darkwire-relay`)
 - `--listen <ip:port>` (`DARKWIRE_RELAY_ADDR`), default `127.0.0.1:7000`
 - `--log-filter <filter>` (`DARKWIRE_LOG_FILTER`), default `darkwire_relay=info,tower_http=warn`
