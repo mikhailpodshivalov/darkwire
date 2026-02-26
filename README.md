@@ -133,8 +133,8 @@ Precedence:
 
 - `No active session`:
   run `/my invite copy` on one side and `/invite CODE` on the other.
-- `clipboard copy failed`:
-  retry `/my invite copy`; some terminals restrict clipboard escape sequences.
+- `clipboard copy not confirmed`:
+  client prints `[invite] code DL1:...` as fallback for manual copy.
 - Need input-race test UI mode:
 ```bash
 darkwire --demo-incoming-ms 200
