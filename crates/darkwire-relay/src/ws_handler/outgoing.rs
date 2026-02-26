@@ -1,11 +1,12 @@
 use crate::app_state::{
-    ConnId, InviteCreated, PrekeyBundleRoute, PrekeyPublished, SessionTermination, SharedState,
+    ConnId, InviteCreated, LoginBinding, PrekeyBundleRoute, PrekeyPublished, SessionTermination,
+    SharedState,
 };
 use axum::extract::ws::{Message, WebSocket};
 use darkwire_protocol::events::{
-    self, Envelope, ErrorCode, ErrorEvent, InviteCreatedEvent, InviteUsedEvent, PongEvent,
-    PrekeyBundleEvent, PrekeyPublishedEvent, RateLimitScope, RateLimitedEvent, ReadyEvent,
-    SessionEndReason, SessionEndedEvent, SessionStartedEvent,
+    self, Envelope, ErrorCode, ErrorEvent, InviteCreatedEvent, InviteUsedEvent, LoginBindingEvent,
+    PongEvent, PrekeyBundleEvent, PrekeyPublishedEvent, RateLimitScope, RateLimitedEvent,
+    ReadyEvent, SessionEndReason, SessionEndedEvent, SessionStartedEvent,
 };
 use serde::Serialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -85,6 +86,46 @@ pub(super) async fn send_invite_used(
         Ok(()) => true,
         Err(err) => {
             warn!(%conn_id, err = %err, "connection.invite_used_send_failed");
+            false
+        }
+    }
+}
+
+pub(super) async fn send_login_bound(
+    socket: &mut WebSocket,
+    request_id: Option<String>,
+    binding: LoginBinding,
+    conn_id: ConnId,
+) -> bool {
+    let event = LoginBindingEvent {
+        login: binding.login,
+        ik_ed25519: binding.ik_ed25519,
+    };
+
+    match send_event(socket, events::names::LOGIN_BOUND, request_id, event).await {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(%conn_id, err = %err, "connection.login_bound_send_failed");
+            false
+        }
+    }
+}
+
+pub(super) async fn send_login_binding(
+    socket: &mut WebSocket,
+    request_id: Option<String>,
+    binding: LoginBinding,
+    conn_id: ConnId,
+) -> bool {
+    let event = LoginBindingEvent {
+        login: binding.login,
+        ik_ed25519: binding.ik_ed25519,
+    };
+
+    match send_event(socket, events::names::LOGIN_BINDING, request_id, event).await {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(%conn_id, err = %err, "connection.login_binding_send_failed");
             false
         }
     }

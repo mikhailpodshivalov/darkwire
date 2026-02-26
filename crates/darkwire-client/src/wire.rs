@@ -1,7 +1,7 @@
 use darkwire_protocol::events::{
     self, E2eMsgRecvEvent, ErrorEvent, HandshakeAcceptRequest, HandshakeInitRequest,
-    InviteCreatedEvent, MsgRecvEvent, PrekeyBundleEvent, PrekeyPublishedEvent, RateLimitedEvent,
-    ReadyEvent, SessionEndReason, SessionEndedEvent, SessionStartedEvent,
+    InviteCreatedEvent, LoginBindingEvent, MsgRecvEvent, PrekeyBundleEvent, PrekeyPublishedEvent,
+    RateLimitedEvent, ReadyEvent, SessionEndReason, SessionEndedEvent, SessionStartedEvent,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -22,6 +22,8 @@ pub enum WireAction {
     HandshakeInitRecv(HandshakeInitRequest),
     HandshakeAcceptRecv(HandshakeAcceptRequest),
     EncryptedMessage(E2eMsgRecvEvent),
+    LoginBound(LoginBindingEvent),
+    LoginBinding(LoginBindingEvent),
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +65,12 @@ pub fn extract_wire_action(raw: &str) -> Option<WireAction> {
         events::names::E2E_MSG_RECV => serde_json::from_value::<E2eMsgRecvEvent>(envelope.data)
             .ok()
             .map(WireAction::EncryptedMessage),
+        events::names::LOGIN_BOUND => serde_json::from_value::<LoginBindingEvent>(envelope.data)
+            .ok()
+            .map(WireAction::LoginBound),
+        events::names::LOGIN_BINDING => serde_json::from_value::<LoginBindingEvent>(envelope.data)
+            .ok()
+            .map(WireAction::LoginBinding),
         _ => None,
     }
 }
@@ -145,6 +153,10 @@ pub fn handle_server_text(raw: &str, state: &mut ClientState) -> Option<String> 
         events::names::E2E_MSG_RECV => {
             return None;
         }
+        events::names::LOGIN_BOUND | events::names::LOGIN_BINDING => {
+            let _ = envelope.data;
+            return None;
+        }
         events::names::SESSION_ENDED => {
             if let Ok(event) = serde_json::from_value::<SessionEndedEvent>(envelope.data) {
                 state.active_session = false;
@@ -207,7 +219,7 @@ fn rate_limit_scope_name(scope: darkwire_protocol::events::RateLimitScope) -> &'
 #[cfg(test)]
 mod tests {
     use super::*;
-    use darkwire_protocol::events::{Envelope, SessionStartedEvent};
+    use darkwire_protocol::events::{Envelope, LoginBindingEvent, SessionStartedEvent};
 
     #[test]
     fn session_started_with_request_id_marks_local_initiator() {
@@ -242,5 +254,25 @@ mod tests {
 
         let _ = handle_server_text(&raw, &mut state);
         assert!(!state.should_initiate_handshake);
+    }
+
+    #[test]
+    fn login_binding_extracts_action_and_avoids_generic_output() {
+        let raw = serde_json::to_string(&Envelope::new(
+            events::names::LOGIN_BINDING,
+            LoginBindingEvent {
+                login: "mike".to_string(),
+                ik_ed25519: "ik_b64u".to_string(),
+            },
+        ))
+        .expect("serialize login.binding envelope");
+
+        assert!(matches!(
+            extract_wire_action(&raw),
+            Some(WireAction::LoginBinding(_))
+        ));
+
+        let mut state = ClientState::default();
+        assert!(handle_server_text(&raw, &mut state).is_none());
     }
 }

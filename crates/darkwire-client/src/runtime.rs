@@ -3,13 +3,15 @@ use crate::{
     commands::{command_help_all_lines, command_help_basic_lines, parse_user_command, UserCommand},
     e2e::SecureMessenger,
     keys::KeyManager,
-    trust::{ActivePeerTrust, SessionTrustState, TrustManager},
+    trust::{fingerprint_short_for_ik, ActivePeerTrust, SessionTrustState, TrustManager},
     ui::TerminalUi,
     wire::{extract_wire_action, handle_server_text, ClientState, WireAction},
 };
 use darkwire_protocol::events::{
-    self, Envelope, InviteCreateRequest, InviteUseRequest, SessionLeaveRequest,
+    self, Envelope, InviteCreateRequest, InviteUseRequest, LoginBindRequest, LoginLookupRequest,
+    SessionLeaveRequest,
 };
+use darkwire_protocol::login::{format_login, normalize_login};
 use futures_util::{stream::SplitSink, SinkExt};
 use serde::Serialize;
 use std::error::Error;
@@ -24,6 +26,8 @@ pub struct ClientRuntime {
     secure_messenger: SecureMessenger,
     trust: TrustManager,
     active_peer_trust: Option<ActivePeerTrust>,
+    active_peer_login: Option<String>,
+    local_login: Option<String>,
     request_counter: u64,
 }
 
@@ -35,6 +39,8 @@ impl ClientRuntime {
             secure_messenger: SecureMessenger::default(),
             trust,
             active_peer_trust: None,
+            active_peer_login: None,
+            local_login: None,
             request_counter: 1,
         }
     }
@@ -203,6 +209,62 @@ impl ClientRuntime {
                 }
                 Ok(true)
             }
+            UserCommand::LoginStatus => {
+                let local_fp = keys.status().fingerprint_short;
+                if let Some(login) = self.local_login.as_ref() {
+                    ui.print_line(&format!(
+                        "[login] local {} fp={}",
+                        format_login(login),
+                        local_fp
+                    ));
+                } else {
+                    ui.print_line(&format!("[login] local unbound fp={local_fp}"));
+                }
+                self.request_login_lookup_by_ik(ws_writer, keys.identity_public_ed25519())
+                    .await?;
+                Ok(true)
+            }
+            UserCommand::LoginSet(raw_login) => {
+                let Some(login) = normalize_login(&raw_login) else {
+                    ui.print_error(
+                        "[login] invalid login format; use 3-24 chars [a-z0-9_.-], optional @ prefix",
+                    );
+                    return Ok(true);
+                };
+
+                let signature = match keys.sign_login_binding(&login) {
+                    Ok(signature) => signature,
+                    Err(err) => {
+                        ui.print_error(&format!("[login] failed to sign bind request: {err}"));
+                        return Ok(true);
+                    }
+                };
+
+                self.send_request(
+                    ws_writer,
+                    events::names::LOGIN_BIND,
+                    LoginBindRequest {
+                        login: login.clone(),
+                        ik_ed25519: keys.identity_public_ed25519().to_string(),
+                        sig_ed25519: signature,
+                    },
+                )
+                .await?;
+                ui.print_line(&format!("[login] binding {} ...", format_login(&login)));
+                Ok(true)
+            }
+            UserCommand::LoginLookup(raw_login) => {
+                let Some(login) = normalize_login(&raw_login) else {
+                    ui.print_error(
+                        "[login] invalid login format; use 3-24 chars [a-z0-9_.-], optional @ prefix",
+                    );
+                    return Ok(true);
+                };
+                self.request_login_lookup_by_login(ws_writer, &login)
+                    .await?;
+                ui.print_line(&format!("[login] resolving {} ...", format_login(&login)));
+                Ok(true)
+            }
             UserCommand::SendMessage(text) => {
                 if !self.state.active_session {
                     ui.print_line("No active session. Use /new or /c CODE");
@@ -253,6 +315,9 @@ impl ClientRuntime {
                     Err(err) => ui.print_error(&format!("[e2e] drop inbound message: {err}")),
                 }
             }
+            WireAction::LoginBound(binding) | WireAction::LoginBinding(binding) => {
+                self.handle_login_binding(binding.login, binding.ik_ed25519, keys, ui);
+            }
             action => {
                 if matches!(
                     action,
@@ -260,6 +325,7 @@ impl ClientRuntime {
                 ) {
                     self.secure_messenger.clear();
                     self.active_peer_trust = None;
+                    self.active_peer_login = None;
                 }
 
                 handle_wire_action(
@@ -281,6 +347,7 @@ impl ClientRuntime {
                         self.state.secure_active = false;
                     } else {
                         let trust = self.trust.evaluate_peer(&material.peer_ik_ed25519)?;
+                        self.active_peer_login = None;
                         self.print_active_trust(ui, &trust);
                         if trust.state == SessionTrustState::KeyChanged {
                             let previous = trust
@@ -292,6 +359,8 @@ impl ClientRuntime {
                                 trust.fingerprint_short
                             ));
                         }
+                        self.request_login_lookup_by_ik(ws_writer, &material.peer_ik_ed25519)
+                            .await?;
                         self.active_peer_trust = Some(trust);
                     }
                 }
@@ -327,6 +396,7 @@ impl ClientRuntime {
         .await?;
         self.secure_messenger.clear();
         self.active_peer_trust = None;
+        self.active_peer_login = None;
         Ok(())
     }
 
@@ -356,6 +426,38 @@ impl ClientRuntime {
             .await
     }
 
+    async fn request_login_lookup_by_login(
+        &mut self,
+        ws_writer: &mut WsWriter,
+        login: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        self.send_request(
+            ws_writer,
+            events::names::LOGIN_LOOKUP,
+            LoginLookupRequest {
+                login: Some(login.to_string()),
+                ik_ed25519: None,
+            },
+        )
+        .await
+    }
+
+    async fn request_login_lookup_by_ik(
+        &mut self,
+        ws_writer: &mut WsWriter,
+        ik_ed25519: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        self.send_request(
+            ws_writer,
+            events::names::LOGIN_LOOKUP,
+            LoginLookupRequest {
+                login: None,
+                ik_ed25519: Some(ik_ed25519.to_string()),
+            },
+        )
+        .await
+    }
+
     async fn send_request<T: Serialize>(
         &mut self,
         ws_writer: &mut WsWriter,
@@ -383,11 +485,53 @@ impl ClientRuntime {
     }
 
     fn print_active_trust(&self, ui: &mut TerminalUi, active: &ActivePeerTrust) {
+        let login = self
+            .active_peer_login
+            .as_ref()
+            .map(|value| format!(" login={}", format_login(value)))
+            .unwrap_or_default();
         ui.print_line(&format!(
-            "[trust] state={} fp={} safety={}",
+            "[trust] state={}{} fp={} safety={}",
             active.state.as_str(),
+            login,
             active.fingerprint_short,
             active.safety_number
         ));
+    }
+
+    fn handle_login_binding(
+        &mut self,
+        login: String,
+        ik_ed25519: String,
+        keys: &KeyManager,
+        ui: &mut TerminalUi,
+    ) {
+        let fp = fingerprint_short_for_ik(&ik_ed25519);
+        let formatted = format_login(&login);
+        if ik_ed25519 == keys.identity_public_ed25519() {
+            self.local_login = Some(login);
+            ui.print_line(&format!("[login] local {formatted} fp={fp}"));
+            return;
+        }
+
+        if let Some(active) = self.active_peer_trust.clone() {
+            if active.peer_ik_ed25519 == ik_ed25519 {
+                self.active_peer_login = Some(login.clone());
+                self.print_active_trust(ui, &active);
+                if active.state == SessionTrustState::KeyChanged {
+                    let previous = active
+                        .previous_fingerprint_short
+                        .as_deref()
+                        .unwrap_or("unknown");
+                    ui.print_error(&format!(
+                        "[trust] WARNING: login {formatted} key changed (prev_fp={previous} new_fp={}); re-verify with /trust verify",
+                        active.fingerprint_short
+                    ));
+                }
+                return;
+            }
+        }
+
+        ui.print_line(&format!("[login] {formatted} fp={fp}"));
     }
 }

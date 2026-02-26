@@ -4,6 +4,8 @@ use uuid::Uuid;
 pub mod names {
     pub const INVITE_CREATE: &str = "invite.create";
     pub const INVITE_USE: &str = "invite.use";
+    pub const LOGIN_BIND: &str = "login.bind";
+    pub const LOGIN_LOOKUP: &str = "login.lookup";
     pub const MSG_SEND: &str = "msg.send";
     pub const E2E_MSG_SEND: &str = "e2e.msg.send";
     pub const SESSION_LEAVE: &str = "session.leave";
@@ -16,6 +18,8 @@ pub mod names {
     pub const READY: &str = "ready";
     pub const INVITE_CREATED: &str = "invite.created";
     pub const INVITE_USED: &str = "invite.used";
+    pub const LOGIN_BOUND: &str = "login.bound";
+    pub const LOGIN_BINDING: &str = "login.binding";
     pub const SESSION_STARTED: &str = "session.started";
     pub const MSG_RECV: &str = "msg.recv";
     pub const E2E_MSG_RECV: &str = "e2e.msg.recv";
@@ -64,6 +68,21 @@ pub struct InviteCreateRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InviteUseRequest {
     pub invite: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoginBindRequest {
+    pub login: String,
+    pub ik_ed25519: String,
+    pub sig_ed25519: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoginLookupRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ik_ed25519: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,6 +184,14 @@ pub struct InviteCreatedEvent {
 pub struct InviteUsedEvent {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoginBindingEvent {
+    pub login: String,
+    pub ik_ed25519: String,
+}
+
+pub type LoginBoundEvent = LoginBindingEvent;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionStartedEvent {
     pub session_id: Uuid,
     pub peer: String,
@@ -233,6 +260,10 @@ pub enum ErrorCode {
     InvalidInvite,
     InviteExpired,
     InviteUsed,
+    LoginInvalid,
+    LoginTaken,
+    LoginNotFound,
+    LoginKeyMismatch,
     NoActiveSession,
     MessageTooLarge,
     UnsupportedProtocol,

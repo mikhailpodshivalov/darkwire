@@ -12,6 +12,9 @@ pub enum UserCommand {
     TrustVerify,
     TrustUnverify,
     TrustList,
+    LoginStatus,
+    LoginSet(String),
+    LoginLookup(String),
     Quit,
     SendMessage(String),
     Ignore,
@@ -80,6 +83,27 @@ pub fn parse_user_command(line: &str) -> UserCommand {
         return UserCommand::TrustList;
     }
 
+    if trimmed.starts_with("/login") {
+        let mut parts = trimmed.split_whitespace();
+        let command = parts.next();
+        let action = parts.next();
+        let value = parts.next();
+        let extra = parts.next();
+
+        if command == Some("/login") && extra.is_none() {
+            match (action, value) {
+                (None, None) => return UserCommand::LoginStatus,
+                (Some("set"), Some(login)) => {
+                    return UserCommand::LoginSet(login.to_string());
+                }
+                (Some("lookup"), Some(login)) => {
+                    return UserCommand::LoginLookup(login.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
     if trimmed.starts_with("/c") {
         let mut parts = trimmed.split_whitespace();
         let command = parts.next();
@@ -125,6 +149,9 @@ pub fn command_help_all_lines() -> &'static [&'static str] {
         "/trust verify - mark active peer as verified",
         "/trust unverify - remove verification for active peer",
         "/trust list - list verified peers",
+        "/login - show local login binding status",
+        "/login set @name - bind login to local identity key",
+        "/login lookup @name - resolve login to identity fingerprint",
         "/q - quit",
         "<text> - send encrypted message in active secure session",
     ]
@@ -227,6 +254,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_command_login_status() {
+        assert_eq!(parse_user_command("/login"), UserCommand::LoginStatus);
+    }
+
+    #[test]
+    fn parse_command_login_set() {
+        assert_eq!(
+            parse_user_command("/login set @mike"),
+            UserCommand::LoginSet("@mike".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_command_login_lookup() {
+        assert_eq!(
+            parse_user_command("/login lookup mike"),
+            UserCommand::LoginLookup("mike".to_string())
+        );
+    }
+
+    #[test]
     fn basic_help_lines_hide_advanced_commands() {
         let help = command_help_basic_lines().join("\n");
         assert!(!help.contains("/keys rotate"));
@@ -238,5 +286,6 @@ mod tests {
         let help = command_help_all_lines().join("\n");
         assert!(help.contains("/keys rotate"));
         assert!(help.contains("/trust verify"));
+        assert!(help.contains("/login set @name"));
     }
 }

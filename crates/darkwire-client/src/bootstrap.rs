@@ -146,7 +146,9 @@ pub async fn handle_wire_action(
                 }
             }
         }
-        WireAction::EncryptedMessage(_) => {}
+        WireAction::EncryptedMessage(_)
+        | WireAction::LoginBound(_)
+        | WireAction::LoginBinding(_) => {}
     }
 
     Ok(())

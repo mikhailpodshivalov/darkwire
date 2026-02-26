@@ -4,19 +4,24 @@ use crate::{
         TakeHandshakeError,
     },
     invite_store::{InviteConsumeError, InviteRecord, InviteStore},
+    login_store::{BindError, LoginStore},
     prekey_store::{OpkRecord, PrekeyStore, SpkRecord},
     rate_limit::{RateLimitHit, RateLimitStore},
     session_store::{SessionCreateError, SessionId, SessionStore},
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use darkwire_protocol::{
     config::LimitsConfig,
     events::{
         HandshakeAcceptRecvEvent, HandshakeAcceptRequest, HandshakeInitRecvEvent,
-        HandshakeInitRequest, InviteCreateRequest, InviteUseRequest, OneTimePrekey,
-        PrekeyGetRequest, PrekeyPublishRequest, PublicPrekeyBundle, SessionEndReason, SignedPrekey,
+        HandshakeInitRequest, InviteCreateRequest, InviteUseRequest, LoginBindRequest,
+        LoginLookupRequest, OneTimePrekey, PrekeyGetRequest, PrekeyPublishRequest,
+        PublicPrekeyBundle, SessionEndReason, SignedPrekey,
     },
     invite::{decode_invite, encode_invite, InvitePayloadV1, INVITE_VERSION, TOKEN_MAX_LEN},
+    login::{login_bind_transcript, normalize_login},
 };
+use ring::signature::{self, UnparsedPublicKey};
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
@@ -77,6 +82,12 @@ pub struct DisconnectOutcome {
 pub struct MessageRoute {
     pub session_id: SessionId,
     pub peer_conn: ConnId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginBinding {
+    pub login: String,
+    pub ik_ed25519: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -180,6 +191,20 @@ pub enum PrekeyGetError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginBindError {
+    InvalidRequest,
+    LoginTaken,
+    KeyMismatch,
+    PeerOffline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginLookupError {
+    InvalidRequest,
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandshakeInitError {
     RateLimited(RateLimitHit),
     InvalidRequest,
@@ -204,6 +229,7 @@ pub struct AppState {
     connections: RwLock<HashMap<ConnId, ConnectionEntry>>,
     invites: InviteStore,
     rate_limits: RateLimitStore,
+    logins: RwLock<LoginStore>,
     prekeys: RwLock<PrekeyStore>,
     handshakes: RwLock<HandshakeStore>,
     sessions: RwLock<SessionStore>,
@@ -217,6 +243,7 @@ impl AppState {
             connections: RwLock::new(HashMap::new()),
             invites: InviteStore::new(),
             rate_limits: RateLimitStore::new(),
+            logins: RwLock::new(LoginStore::new()),
             prekeys: RwLock::new(PrekeyStore::new()),
             handshakes: RwLock::new(HandshakeStore::new()),
             sessions: RwLock::new(SessionStore::new()),
@@ -593,6 +620,71 @@ impl AppState {
         })
     }
 
+    pub async fn bind_login(
+        &self,
+        conn_id: ConnId,
+        req: LoginBindRequest,
+    ) -> Result<LoginBinding, LoginBindError> {
+        if !self.connection_exists(conn_id).await {
+            return Err(LoginBindError::PeerOffline);
+        }
+
+        let normalized = normalize_login(&req.login).ok_or(LoginBindError::InvalidRequest)?;
+        validate_login_bind_request(&normalized, &req).map_err(map_login_validation_error)?;
+
+        let conn_ik = self
+            .prekeys
+            .read()
+            .await
+            .identity_key_for_conn(conn_id)
+            .map(str::to_string)
+            .ok_or(LoginBindError::KeyMismatch)?;
+
+        if conn_ik != req.ik_ed25519 {
+            return Err(LoginBindError::KeyMismatch);
+        }
+
+        let binding = self
+            .logins
+            .write()
+            .await
+            .bind(normalized, req.ik_ed25519)
+            .map_err(map_login_bind_store_error)?;
+
+        Ok(LoginBinding {
+            login: binding.login,
+            ik_ed25519: binding.ik_ed25519,
+        })
+    }
+
+    pub async fn lookup_login(
+        &self,
+        req: LoginLookupRequest,
+    ) -> Result<LoginBinding, LoginLookupError> {
+        let binding = match (req.login, req.ik_ed25519) {
+            (Some(login), None) => {
+                let normalized = normalize_login(&login).ok_or(LoginLookupError::InvalidRequest)?;
+                self.logins.read().await.get_by_login(&normalized)
+            }
+            (None, Some(ik_ed25519)) => {
+                if ik_ed25519.trim().is_empty() {
+                    return Err(LoginLookupError::InvalidRequest);
+                }
+                self.logins.read().await.get_by_ik(ik_ed25519.trim())
+            }
+            _ => return Err(LoginLookupError::InvalidRequest),
+        };
+
+        let Some(binding) = binding else {
+            return Err(LoginLookupError::NotFound);
+        };
+
+        Ok(LoginBinding {
+            login: binding.login,
+            ik_ed25519: binding.ik_ed25519,
+        })
+    }
+
     pub async fn route_handshake_init(
         &self,
         initiator_conn: ConnId,
@@ -847,6 +939,68 @@ fn map_msg_send_error(err: MsgSendError) -> E2eMsgSendError {
     }
 }
 
+fn map_login_bind_store_error(err: BindError) -> LoginBindError {
+    match err {
+        BindError::LoginTaken => LoginBindError::LoginTaken,
+    }
+}
+
+fn map_login_validation_error(err: LoginValidationError) -> LoginBindError {
+    match err {
+        LoginValidationError::MissingIdentityKey
+        | LoginValidationError::MissingSignature
+        | LoginValidationError::InvalidLogin => LoginBindError::InvalidRequest,
+        LoginValidationError::KeyMismatch | LoginValidationError::InvalidSignature => {
+            LoginBindError::KeyMismatch
+        }
+    }
+}
+
+fn validate_login_bind_request(
+    normalized_login: &str,
+    req: &LoginBindRequest,
+) -> Result<(), LoginValidationError> {
+    if normalized_login.is_empty() {
+        return Err(LoginValidationError::InvalidLogin);
+    }
+    if req.ik_ed25519.trim().is_empty() {
+        return Err(LoginValidationError::MissingIdentityKey);
+    }
+    if req.sig_ed25519.trim().is_empty() {
+        return Err(LoginValidationError::MissingSignature);
+    }
+
+    verify_login_bind_signature(normalized_login, &req.ik_ed25519, &req.sig_ed25519)
+        .map_err(|_| LoginValidationError::InvalidSignature)?;
+    Ok(())
+}
+
+fn verify_login_bind_signature(
+    login: &str,
+    ik_ed25519: &str,
+    sig_ed25519: &str,
+) -> Result<(), LoginValidationError> {
+    let key_bytes = URL_SAFE_NO_PAD
+        .decode(ik_ed25519.as_bytes())
+        .map_err(|_| LoginValidationError::KeyMismatch)?;
+    if key_bytes.len() != 32 {
+        return Err(LoginValidationError::KeyMismatch);
+    }
+
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(sig_ed25519.as_bytes())
+        .map_err(|_| LoginValidationError::InvalidSignature)?;
+    if sig_bytes.len() != 64 {
+        return Err(LoginValidationError::InvalidSignature);
+    }
+
+    let transcript = login_bind_transcript(login, ik_ed25519);
+    let verifier = UnparsedPublicKey::new(&signature::ED25519, key_bytes);
+    verifier
+        .verify(&transcript, &sig_bytes)
+        .map_err(|_| LoginValidationError::InvalidSignature)
+}
+
 fn validate_prekey_publish(req: &PrekeyPublishRequest) -> Result<(), PrekeyValidationError> {
     if req.ik_ed25519.trim().is_empty() {
         return Err(PrekeyValidationError::MissingIdentityKey);
@@ -929,6 +1083,15 @@ enum HandshakeValidationError {
     TimestampOutOfSkew,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginValidationError {
+    InvalidLogin,
+    MissingIdentityKey,
+    MissingSignature,
+    KeyMismatch,
+    InvalidSignature,
+}
+
 fn min_interval_for_rate(rate_per_sec: u32) -> Duration {
     if rate_per_sec == 0 {
         return Duration::ZERO;
@@ -953,9 +1116,14 @@ fn generate_token(len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use darkwire_protocol::events::{
-        HandshakeAcceptRequest, HandshakeInitRequest, InviteCreateRequest, OneTimePrekey,
-        PrekeyGetRequest, PrekeyPublishRequest, SignedPrekey,
+        HandshakeAcceptRequest, HandshakeInitRequest, InviteCreateRequest, LoginBindRequest,
+        LoginLookupRequest, OneTimePrekey, PrekeyGetRequest, PrekeyPublishRequest, SignedPrekey,
+    };
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
     };
     use std::net::{IpAddr, Ipv4Addr};
     use tokio::sync::mpsc;
@@ -976,8 +1144,12 @@ mod tests {
     }
 
     fn sample_prekey_publish(opk_ids: &[u32]) -> PrekeyPublishRequest {
+        sample_prekey_publish_with_ik("ik_ed25519_b64u".to_string(), opk_ids)
+    }
+
+    fn sample_prekey_publish_with_ik(ik_ed25519: String, opk_ids: &[u32]) -> PrekeyPublishRequest {
         PrekeyPublishRequest {
-            ik_ed25519: "ik_ed25519_b64u".to_string(),
+            ik_ed25519,
             spk: SignedPrekey {
                 id: 7,
                 x25519: "spk_x25519_b64u".to_string(),
@@ -992,6 +1164,29 @@ mod tests {
                     x25519: format!("opk_{id}_b64u"),
                 })
                 .collect(),
+        }
+    }
+
+    fn generate_identity_keypair() -> Ed25519KeyPair {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate identity key");
+        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("decode generated identity key")
+    }
+
+    fn keypair_public_b64u(keypair: &Ed25519KeyPair) -> String {
+        URL_SAFE_NO_PAD.encode(keypair.public_key().as_ref())
+    }
+
+    fn signed_login_bind_request(login: &str, keypair: &Ed25519KeyPair) -> LoginBindRequest {
+        let ik_ed25519 = keypair_public_b64u(keypair);
+        let normalized = normalize_login(login).expect("login must normalize");
+        let transcript = login_bind_transcript(&normalized, &ik_ed25519);
+        let signature = keypair.sign(&transcript);
+
+        LoginBindRequest {
+            login: login.to_string(),
+            ik_ed25519,
+            sig_ed25519: URL_SAFE_NO_PAD.encode(signature.as_ref()),
         }
     }
 
@@ -1656,6 +1851,116 @@ mod tests {
         assert_eq!(peer_ended.session_id, joined.session_id);
         assert_eq!(peer_ended.peer_conn, joiner);
         assert_eq!(peer_ended.reason, SessionEndReason::PeerDisconnect);
+    }
+
+    #[tokio::test]
+    async fn login_bind_and_lookup_roundtrip() {
+        let state = AppState::new(LimitsConfig::default());
+        let (tx, _rx) = channel();
+        let conn = state.register_connection(test_ip(70), tx).await;
+        let keypair = generate_identity_keypair();
+        let ik_ed25519 = keypair_public_b64u(&keypair);
+
+        state
+            .publish_prekeys(
+                conn,
+                test_ip(70),
+                sample_prekey_publish_with_ik(ik_ed25519.clone(), &[1]),
+            )
+            .await
+            .expect("prekey publish should pass");
+
+        let bound = state
+            .bind_login(conn, signed_login_bind_request("@Mike", &keypair))
+            .await
+            .expect("login bind should pass");
+        assert_eq!(bound.login, "mike");
+        assert_eq!(bound.ik_ed25519, ik_ed25519);
+
+        let by_login = state
+            .lookup_login(LoginLookupRequest {
+                login: Some("mike".to_string()),
+                ik_ed25519: None,
+            })
+            .await
+            .expect("lookup by login should pass");
+        assert_eq!(by_login.login, "mike");
+
+        let by_ik = state
+            .lookup_login(LoginLookupRequest {
+                login: None,
+                ik_ed25519: Some(bound.ik_ed25519),
+            })
+            .await
+            .expect("lookup by ik should pass");
+        assert_eq!(by_ik.login, "mike");
+    }
+
+    #[tokio::test]
+    async fn login_bind_rejects_taken_login() {
+        let state = AppState::new(LimitsConfig::default());
+        let (tx_a, _rx_a) = channel();
+        let (tx_b, _rx_b) = channel();
+        let conn_a = state.register_connection(test_ip(71), tx_a).await;
+        let conn_b = state.register_connection(test_ip(72), tx_b).await;
+        let key_a = generate_identity_keypair();
+        let key_b = generate_identity_keypair();
+
+        state
+            .publish_prekeys(
+                conn_a,
+                test_ip(71),
+                sample_prekey_publish_with_ik(keypair_public_b64u(&key_a), &[1]),
+            )
+            .await
+            .expect("prekey publish A should pass");
+        state
+            .publish_prekeys(
+                conn_b,
+                test_ip(72),
+                sample_prekey_publish_with_ik(keypair_public_b64u(&key_b), &[2]),
+            )
+            .await
+            .expect("prekey publish B should pass");
+
+        state
+            .bind_login(conn_a, signed_login_bind_request("mike", &key_a))
+            .await
+            .expect("first bind should pass");
+
+        let err = state
+            .bind_login(conn_b, signed_login_bind_request("mike", &key_b))
+            .await
+            .expect_err("second bind should fail");
+        assert_eq!(err, LoginBindError::LoginTaken);
+    }
+
+    #[tokio::test]
+    async fn login_bind_rejects_signature_mismatch() {
+        let state = AppState::new(LimitsConfig::default());
+        let (tx, _rx) = channel();
+        let conn = state.register_connection(test_ip(73), tx).await;
+        let legit = generate_identity_keypair();
+        let attacker = generate_identity_keypair();
+        let legit_ik = keypair_public_b64u(&legit);
+
+        state
+            .publish_prekeys(
+                conn,
+                test_ip(73),
+                sample_prekey_publish_with_ik(legit_ik.clone(), &[1]),
+            )
+            .await
+            .expect("prekey publish should pass");
+
+        let mut forged = signed_login_bind_request("mike", &attacker);
+        forged.ik_ed25519 = legit_ik;
+
+        let err = state
+            .bind_login(conn, forged)
+            .await
+            .expect_err("forged signature should fail");
+        assert_eq!(err, LoginBindError::KeyMismatch);
     }
 
     #[test]

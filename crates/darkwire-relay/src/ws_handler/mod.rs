@@ -1,4 +1,5 @@
 mod e2e;
+mod login;
 mod outgoing;
 mod parse;
 
@@ -360,6 +361,12 @@ async fn handle_text_message(
                     .await
                 }
             }
+        }
+        events::names::LOGIN_BIND => {
+            login::handle_login_bind(socket, state, conn_id, request_id, incoming.data).await
+        }
+        events::names::LOGIN_LOOKUP => {
+            login::handle_login_lookup(socket, state, conn_id, request_id, incoming.data).await
         }
         events::names::E2E_PREKEY_PUBLISH => {
             e2e::handle_prekey_publish(socket, state, conn_id, ip, request_id, incoming.data).await

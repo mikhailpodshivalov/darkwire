@@ -352,9 +352,11 @@ name = "darkwire-relay"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "clap",
  "darkwire-protocol",
  "futures-util",
+ "ring",
  "serde",
  "serde_json",
  "tokio",

@@ -71,6 +71,12 @@ impl PrekeyStore {
         })
     }
 
+    pub fn identity_key_for_conn(&self, conn_id: ConnId) -> Option<&str> {
+        self.by_conn
+            .get(&conn_id)
+            .map(|record| record.ik_ed25519.as_str())
+    }
+
     pub fn remove_bundle(&mut self, conn_id: ConnId) -> bool {
         self.by_conn.remove(&conn_id).is_some()
     }

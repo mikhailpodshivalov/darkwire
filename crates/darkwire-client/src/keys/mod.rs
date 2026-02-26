@@ -2,6 +2,7 @@ mod handshake;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use darkwire_protocol::events::{OneTimePrekey, PrekeyPublishRequest, SignedPrekey};
+use darkwire_protocol::login::login_bind_transcript;
 use ring::{
     digest::{digest, SHA256},
     rand::{SecureRandom, SystemRandom},
@@ -118,6 +119,15 @@ impl KeyManager {
             status.signed_prekey_expires_unix,
             status.one_time_prekeys
         )
+    }
+
+    pub fn identity_public_ed25519(&self) -> &str {
+        &self.store.identity.public_ed25519_b64u
+    }
+
+    pub fn sign_login_binding(&self, login: &str) -> Result<String, Box<dyn Error>> {
+        let transcript = login_bind_transcript(login, self.identity_public_ed25519());
+        sign_ed25519_message(&self.store.identity.pkcs8_ed25519_b64u, &transcript)
     }
 
     pub fn build_prekey_publish_request(&self) -> PrekeyPublishRequest {
@@ -362,18 +372,24 @@ fn sign_spk(
     spk_id: u32,
     exp_unix: u64,
 ) -> Result<String, Box<dyn Error>> {
-    let pkcs8 = decode_b64u(identity_pkcs8_b64u)?;
     let spk_public = decode_b64u(spk_public_x25519_b64u)?;
-
-    let keypair = Ed25519KeyPair::from_pkcs8(&pkcs8)
-        .map_err(|_| "failed to decode identity key for prekey signing")?;
 
     let mut transcript = Vec::with_capacity(spk_public.len() + 4 + 8);
     transcript.extend_from_slice(&spk_public);
     transcript.extend_from_slice(&spk_id.to_be_bytes());
     transcript.extend_from_slice(&exp_unix.to_be_bytes());
 
-    let signature = keypair.sign(&transcript);
+    sign_ed25519_message(identity_pkcs8_b64u, &transcript)
+}
+
+fn sign_ed25519_message(
+    identity_pkcs8_b64u: &str,
+    message: &[u8],
+) -> Result<String, Box<dyn Error>> {
+    let pkcs8 = decode_b64u(identity_pkcs8_b64u)?;
+    let keypair = Ed25519KeyPair::from_pkcs8(&pkcs8)
+        .map_err(|_| "failed to decode identity key for signing")?;
+    let signature = keypair.sign(message);
     Ok(encode_b64u(signature.as_ref()))
 }
 

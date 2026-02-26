@@ -123,6 +123,8 @@ Client now auto-runs session bootstrap (`prekey.get` -> `handshake.init/accept`)
 Wait for `[e2e] secure session established ...` before sending messages.
 
 ## Client commands
+- `/help` show basic commands
+- `/help all` show full command list
 - `/new` create/rotate invite (invalidates previous invite for this client)
 - `/i` legacy alias for `/new`
 - `/c CODE` connect by invite
@@ -130,6 +132,13 @@ Wait for `[e2e] secure session established ...` before sending messages.
 - `/keys rotate` rotate signed prekey and publish new bundle
 - `/keys refill` refill OPK pool to target and publish new bundle
 - `/keys revoke` revoke local identity (regenerate identity + prekeys) and publish new bundle
+- `/trust` show active peer trust state + fingerprint/safety number
+- `/trust verify` mark active peer identity as verified
+- `/trust unverify` remove active peer verification
+- `/trust list` list verified contacts
+- `/login` show local login binding status (and request fresh relay lookup)
+- `/login set @name` bind unique login to local identity key (signed request)
+- `/login lookup @name` resolve login to identity key fingerprint
 - `/q` quit (sends `session.leave` when session is active)
 - any other non-empty line sends chat message to active secure session
 

@@ -2,6 +2,7 @@ mod app_state;
 mod handshake_store;
 mod invite_store;
 mod logging;
+mod login_store;
 mod prekey_store;
 mod rate_limit;
 mod session_store;
@@ -67,14 +68,21 @@ fn init_tracing(log_filter: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use darkwire_protocol::events::{
         self, E2eMsgAd, E2eMsgSendRequest, Envelope, ErrorCode, ErrorEvent, HandshakeAcceptRequest,
         HandshakeInitRequest, InviteCreateRequest, InviteCreatedEvent, InviteUseRequest,
-        MsgRecvEvent, MsgSendRequest, OneTimePrekey, PrekeyBundleEvent, PrekeyGetRequest,
-        PrekeyPublishRequest, PrekeyPublishedEvent, RateLimitScope, RateLimitedEvent,
-        SessionEndReason, SessionEndedEvent, SessionStartedEvent, SignedPrekey,
+        LoginBindRequest, LoginBindingEvent, LoginLookupRequest, MsgRecvEvent, MsgSendRequest,
+        OneTimePrekey, PrekeyBundleEvent, PrekeyGetRequest, PrekeyPublishRequest,
+        PrekeyPublishedEvent, RateLimitScope, RateLimitedEvent, SessionEndReason,
+        SessionEndedEvent, SessionStartedEvent, SignedPrekey,
     };
+    use darkwire_protocol::login::login_bind_transcript;
     use futures_util::{SinkExt, StreamExt};
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
     use serde::{Deserialize, Serialize};
     use std::time::Duration;
     use tokio::{
@@ -673,6 +681,97 @@ mod tests {
         let _ = server_task.await;
     }
 
+    #[tokio::test]
+    async fn integration_login_bind_lookup_and_hijack_rejection() {
+        let (addr, shutdown_tx, server_task) = spawn_test_relay(LimitsConfig::default()).await;
+
+        let mut owner = connect_client(addr).await;
+        let mut attacker = connect_client(addr).await;
+        assert_eq!(
+            recv_with_timeout(&mut owner).await.event_type,
+            events::names::READY
+        );
+        assert_eq!(
+            recv_with_timeout(&mut attacker).await.event_type,
+            events::names::READY
+        );
+
+        let owner_key = generate_identity_keypair();
+        let owner_ik = keypair_public_b64u(&owner_key);
+        send_event(
+            &mut owner,
+            events::names::E2E_PREKEY_PUBLISH,
+            "req-owner-publish",
+            sample_prekey_publish_with_ik(&owner_ik, 1, &[1]),
+        )
+        .await;
+        let _ = recv_until(&mut owner, events::names::E2E_PREKEY_PUBLISHED).await;
+
+        send_event(
+            &mut owner,
+            events::names::LOGIN_BIND,
+            "req-owner-bind",
+            LoginBindRequest {
+                login: "@mike".to_string(),
+                ik_ed25519: owner_ik.clone(),
+                sig_ed25519: sign_login_bind("@mike", &owner_ik, &owner_key),
+            },
+        )
+        .await;
+
+        let bound = recv_until(&mut owner, events::names::LOGIN_BOUND).await;
+        let bound_payload = serde_json::from_value::<LoginBindingEvent>(bound.data)
+            .expect("login.bound payload should parse");
+        assert_eq!(bound_payload.login, "mike");
+        assert_eq!(bound_payload.ik_ed25519, owner_ik);
+
+        let attacker_key = generate_identity_keypair();
+        let attacker_ik = keypair_public_b64u(&attacker_key);
+        send_event(
+            &mut attacker,
+            events::names::E2E_PREKEY_PUBLISH,
+            "req-attacker-publish",
+            sample_prekey_publish_with_ik(&attacker_ik, 2, &[2]),
+        )
+        .await;
+        let _ = recv_until(&mut attacker, events::names::E2E_PREKEY_PUBLISHED).await;
+
+        send_event(
+            &mut attacker,
+            events::names::LOGIN_BIND,
+            "req-attacker-bind",
+            LoginBindRequest {
+                login: "mike".to_string(),
+                ik_ed25519: attacker_ik.clone(),
+                sig_ed25519: sign_login_bind("mike", &attacker_ik, &attacker_key),
+            },
+        )
+        .await;
+        let taken = recv_until(&mut attacker, events::names::ERROR).await;
+        let taken_payload = serde_json::from_value::<ErrorEvent>(taken.data)
+            .expect("login taken error payload should parse");
+        assert_eq!(taken_payload.code, ErrorCode::LoginTaken);
+
+        send_event(
+            &mut attacker,
+            events::names::LOGIN_LOOKUP,
+            "req-lookup",
+            LoginLookupRequest {
+                login: Some("mike".to_string()),
+                ik_ed25519: None,
+            },
+        )
+        .await;
+        let lookup = recv_until(&mut attacker, events::names::LOGIN_BINDING).await;
+        let lookup_payload = serde_json::from_value::<LoginBindingEvent>(lookup.data)
+            .expect("login.binding payload should parse");
+        assert_eq!(lookup_payload.login, "mike");
+        assert_eq!(lookup_payload.ik_ed25519, keypair_public_b64u(&owner_key));
+
+        let _ = shutdown_tx.send(());
+        let _ = server_task.await;
+    }
+
     async fn spawn_test_relay(
         limits: LimitsConfig,
     ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
@@ -795,8 +894,16 @@ mod tests {
     }
 
     fn sample_prekey_publish(spk_id: u32, opk_ids: &[u32]) -> PrekeyPublishRequest {
+        sample_prekey_publish_with_ik("ik_ed25519_b64u", spk_id, opk_ids)
+    }
+
+    fn sample_prekey_publish_with_ik(
+        ik_ed25519: &str,
+        spk_id: u32,
+        opk_ids: &[u32],
+    ) -> PrekeyPublishRequest {
         PrekeyPublishRequest {
-            ik_ed25519: "ik_ed25519_b64u".to_string(),
+            ik_ed25519: ik_ed25519.to_string(),
             spk: SignedPrekey {
                 id: spk_id,
                 x25519: "spk_x25519_b64u".to_string(),
@@ -812,5 +919,21 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn generate_identity_keypair() -> Ed25519KeyPair {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate test identity key");
+        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("decode test identity key")
+    }
+
+    fn keypair_public_b64u(keypair: &Ed25519KeyPair) -> String {
+        URL_SAFE_NO_PAD.encode(keypair.public_key().as_ref())
+    }
+
+    fn sign_login_bind(login: &str, ik_ed25519: &str, keypair: &Ed25519KeyPair) -> String {
+        let transcript = login_bind_transcript(login, ik_ed25519);
+        let signature = keypair.sign(&transcript);
+        URL_SAFE_NO_PAD.encode(signature.as_ref())
     }
 }

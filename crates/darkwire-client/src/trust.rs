@@ -183,6 +183,10 @@ pub fn default_trust_file_path(key_file: &Path) -> PathBuf {
         .join(DEFAULT_TRUST_FILE)
 }
 
+pub fn fingerprint_short_for_ik(ik_ed25519_b64u: &str) -> String {
+    fingerprint_short(ik_ed25519_b64u)
+}
+
 fn fingerprint_short(ik_ed25519_b64u: &str) -> String {
     let source = decode_peer_key(ik_ed25519_b64u);
     let hash = digest(&SHA256, &source);
