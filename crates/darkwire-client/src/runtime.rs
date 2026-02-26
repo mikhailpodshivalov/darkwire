@@ -21,6 +21,10 @@ use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 pub type WsWriter = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
+const USERNAME_PROMPT: &str = "Who are you? enter your username:";
+const LOGIN_FORMAT_ERROR: &str =
+    "[login] invalid login format; use 3-24 chars [a-z0-9_.-], optional @ prefix";
+
 pub struct ClientRuntime {
     state: ClientState,
     bootstrap: BootstrapState,
@@ -87,11 +91,8 @@ impl ClientRuntime {
         keys: &mut KeyManager,
     ) -> Result<bool, Box<dyn Error>> {
         if self.awaiting_username_entry && !line.trim().starts_with('/') {
-            let Some(login) = normalize_login(line) else {
-                ui.print_error(
-                    "[login] invalid username format; use 3-24 chars [a-z0-9_.-], optional @ prefix",
-                );
-                ui.print_line("Who are you? enter your username:");
+            let Some(login) = self.normalize_login_or_print_error(line, ui) else {
+                self.print_username_prompt(ui);
                 return Ok(true);
             };
 
@@ -238,10 +239,7 @@ impl ClientRuntime {
                 Ok(true)
             }
             UserCommand::SetUsername(raw_login) => {
-                let Some(login) = normalize_login(&raw_login) else {
-                    ui.print_error(
-                        "[login] invalid login format; use 3-24 chars [a-z0-9_.-], optional @ prefix",
-                    );
+                let Some(login) = self.normalize_login_or_print_error(&raw_login, ui) else {
                     return Ok(true);
                 };
                 self.bind_local_login(ws_writer, keys, &login, ui).await?;
@@ -252,10 +250,7 @@ impl ClientRuntime {
                 Ok(true)
             }
             UserCommand::LoginLookup(raw_login) => {
-                let Some(login) = normalize_login(&raw_login) else {
-                    ui.print_error(
-                        "[login] invalid login format; use 3-24 chars [a-z0-9_.-], optional @ prefix",
-                    );
+                let Some(login) = self.normalize_login_or_print_error(&raw_login, ui) else {
                     return Ok(true);
                 };
                 self.request_login_lookup_by_login(ws_writer, &login)
@@ -370,10 +365,12 @@ impl ClientRuntime {
                                 .previous_fingerprint_short
                                 .as_deref()
                                 .unwrap_or("unknown");
-                            ui.print_error(&format!(
-                                "[trust] WARNING: peer identity key changed (prev_fp={previous} new_fp={}); use /accept-key to continue",
-                                trust.fingerprint_short
-                            ));
+                            self.print_key_changed_warning(
+                                ui,
+                                previous,
+                                &trust.fingerprint_short,
+                                None,
+                            );
                         }
                         self.request_login_lookup_by_ik(
                             ws_writer,
@@ -604,10 +601,12 @@ impl ClientRuntime {
                         .previous_fingerprint_short
                         .as_deref()
                         .unwrap_or("unknown");
-                    ui.print_error(&format!(
-                        "[trust] WARNING: login {formatted} key changed (prev_fp={previous} new_fp={}); use /accept-key to continue",
-                        active.fingerprint_short
-                    ));
+                    self.print_key_changed_warning(
+                        ui,
+                        previous,
+                        &active.fingerprint_short,
+                        Some(&login),
+                    );
                 }
             }
         }
@@ -637,7 +636,7 @@ impl ClientRuntime {
             && self.local_login.is_none()
         {
             self.awaiting_username_entry = true;
-            ui.print_line("Who are you? enter your username:");
+            self.print_username_prompt(ui);
             return;
         }
 
@@ -690,5 +689,42 @@ impl ClientRuntime {
         self.awaiting_username_entry = false;
         ui.print_line(&format!("[login] binding {} ...", format_login(login)));
         Ok(())
+    }
+
+    fn normalize_login_or_print_error(
+        &self,
+        raw_login: &str,
+        ui: &mut TerminalUi,
+    ) -> Option<String> {
+        let Some(login) = normalize_login(raw_login) else {
+            ui.print_error(LOGIN_FORMAT_ERROR);
+            return None;
+        };
+
+        Some(login)
+    }
+
+    fn print_username_prompt(&self, ui: &mut TerminalUi) {
+        ui.print_line(USERNAME_PROMPT);
+    }
+
+    fn print_key_changed_warning(
+        &self,
+        ui: &mut TerminalUi,
+        previous_fingerprint: &str,
+        new_fingerprint: &str,
+        login: Option<&str>,
+    ) {
+        if let Some(login) = login {
+            ui.print_error(&format!(
+                "[trust] WARNING: login {} key changed (prev_fp={previous_fingerprint} new_fp={new_fingerprint}); use /accept-key to continue",
+                format_login(login)
+            ));
+            return;
+        }
+
+        ui.print_error(&format!(
+            "[trust] WARNING: peer identity key changed (prev_fp={previous_fingerprint} new_fp={new_fingerprint}); use /accept-key to continue",
+        ));
     }
 }
