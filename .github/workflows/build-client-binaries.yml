@@ -27,6 +27,11 @@ jobs:
             artifact_name: darkwire-linux-x64
             binary_path: target/x86_64-unknown-linux-gnu/release/darkwire
             asset_name: darkwire-linux-x64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_name: darkwire-linux-arm64
+            binary_path: target/aarch64-unknown-linux-gnu/release/darkwire
+            asset_name: darkwire-linux-arm64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: darkwire-windows-x64
@@ -103,6 +108,7 @@ jobs:
           set -euo pipefail
           ls -lah dist
           test -f dist/darkwire-linux-x64
+          test -f dist/darkwire-linux-arm64
           test -f dist/darkwire-windows-x64.exe
           test -f dist/darkwire-macos-arm64
 
@@ -114,6 +120,7 @@ jobs:
             cd dist
             sha256sum \
               darkwire-linux-x64 \
+              darkwire-linux-arm64 \
               darkwire-windows-x64.exe \
               darkwire-macos-arm64 > SHA256SUMS.txt
           )
@@ -128,6 +135,7 @@ jobs:
           overwrite_files: true
           files: |
             dist/darkwire-linux-x64
+            dist/darkwire-linux-arm64
             dist/darkwire-windows-x64.exe
             dist/darkwire-macos-arm64
             dist/SHA256SUMS.txt
