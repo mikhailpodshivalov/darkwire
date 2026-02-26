@@ -387,6 +387,7 @@ fn decode_b64u_fixed_12(value: &str) -> Result<[u8; 12], base64::DecodeError> {
 mod tests {
     use super::*;
     use crate::keys::HandshakeRole;
+    use std::collections::BTreeSet;
 
     fn material_for(role: HandshakeRole) -> SecureSessionMaterial {
         SecureSessionMaterial {
@@ -491,6 +492,59 @@ mod tests {
     }
 
     #[test]
+    fn bulk_out_of_order_delivery_is_reassembled_without_loss() {
+        let init_material = material_for(HandshakeRole::Initiator);
+        let mut resp_material = material_for(HandshakeRole::Responder);
+        resp_material.session_id = init_material.session_id;
+        resp_material.hs_id = init_material.hs_id;
+        resp_material.root_key_b64u = init_material.root_key_b64u.clone();
+
+        let mut initiator = SecureMessenger::default();
+        let mut responder = SecureMessenger::default();
+        initiator
+            .activate(&init_material)
+            .expect("activate initiator");
+        responder
+            .activate(&resp_material)
+            .expect("activate responder");
+
+        let mut outbound = Vec::new();
+        for n in 1..=32_u64 {
+            outbound.push(
+                initiator
+                    .encrypt_outgoing(&format!("m{n}"))
+                    .expect("encrypt message"),
+            );
+        }
+
+        let mut delivered = Vec::new();
+        for idx in (1..outbound.len()).step_by(2) {
+            delivered.push(
+                responder
+                    .decrypt_incoming(&outbound[idx])
+                    .expect("decrypt out-of-order even message"),
+            );
+        }
+        for idx in (0..outbound.len()).step_by(2) {
+            delivered.push(
+                responder
+                    .decrypt_incoming(&outbound[idx])
+                    .expect("decrypt delayed odd message"),
+            );
+        }
+
+        let unique: BTreeSet<String> = delivered.into_iter().collect();
+        assert_eq!(unique.len(), outbound.len());
+        assert!(unique.contains("m1"));
+        assert!(unique.contains("m32"));
+
+        let replay = responder
+            .decrypt_incoming(&outbound[0])
+            .expect_err("replay after full delivery must fail");
+        assert!(matches!(replay, SecureMessagingError::ReplayDetected(1)));
+    }
+
+    #[test]
     fn skipped_window_overflow_is_rejected() {
         let init_material = material_for(HandshakeRole::Initiator);
         let mut resp_material = material_for(HandshakeRole::Responder);
@@ -532,6 +586,53 @@ mod tests {
             }
             other => panic!("unexpected error variant: {other}"),
         }
+    }
+
+    #[test]
+    fn out_of_order_beyond_forward_gap_does_not_advance_recv_counter() {
+        let init_material = material_for(HandshakeRole::Initiator);
+        let mut resp_material = material_for(HandshakeRole::Responder);
+        resp_material.session_id = init_material.session_id;
+        resp_material.hs_id = init_material.hs_id;
+        resp_material.root_key_b64u = init_material.root_key_b64u.clone();
+
+        let mut initiator = SecureMessenger::default();
+        let mut responder = SecureMessenger::default();
+        initiator
+            .activate(&init_material)
+            .expect("activate initiator");
+        responder
+            .activate(&resp_material)
+            .expect("activate responder");
+
+        let mut outbound = Vec::new();
+        for n in 1..=1030_u64 {
+            outbound.push(
+                initiator
+                    .encrypt_outgoing(&format!("m{n}"))
+                    .expect("encrypt message"),
+            );
+        }
+
+        let err = responder
+            .decrypt_incoming(&outbound[1029])
+            .expect_err("message beyond forward gap must fail");
+        assert!(matches!(
+            err,
+            SecureMessagingError::OutOfOrder {
+                expected: 1,
+                got: 1030
+            }
+        ));
+
+        let first = responder
+            .decrypt_incoming(&outbound[0])
+            .expect("receiver state must still accept first message");
+        assert_eq!(first, "m1");
+        let second = responder
+            .decrypt_incoming(&outbound[1])
+            .expect("receiver state must still accept second message");
+        assert_eq!(second, "m2");
     }
 
     #[test]
