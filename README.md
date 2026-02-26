@@ -128,16 +128,18 @@ Wait for `[e2e] secure session established ...` before sending messages.
 - `/new` create/rotate invite (invalidates previous invite for this client)
 - `/i` legacy alias for `/new`
 - `/c CODE` connect by invite
+- `/me @name` set/change your username (recommended UX path)
+- `/accept-key` accept peer key change and continue messaging
 - `/keys` show local key status (fingerprint, signed prekey id/expiry, OPK count)
 - `/keys rotate` rotate signed prekey and publish new bundle
 - `/keys refill` refill OPK pool to target and publish new bundle
 - `/keys revoke` revoke local identity (regenerate identity + prekeys) and publish new bundle
 - `/trust` show active peer trust state + fingerprint/safety number
-- `/trust verify` mark active peer identity as verified
+- `/trust verify` mark active peer identity as verified (advanced/manual flow)
 - `/trust unverify` remove active peer verification
 - `/trust list` list verified contacts
 - `/login` show local login binding status (and request fresh relay lookup)
-- `/login set @name` bind unique login to local identity key (signed request)
+- `/login set @name` legacy alias for `/me @name`
 - `/login lookup @name` resolve login to identity key fingerprint
 - `/q` quit (sends `session.leave` when session is active)
 - any other non-empty line sends chat message to active secure session
