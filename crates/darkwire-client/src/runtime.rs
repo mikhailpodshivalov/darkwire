@@ -116,7 +116,27 @@ impl ClientRuntime {
             return Ok(true);
         }
 
-        match parse_user_command(line) {
+        self.execute_user_command(
+            parse_user_command(line),
+            ws_writer,
+            ui,
+            invite_relay,
+            invite_ttl,
+            keys,
+        )
+        .await
+    }
+
+    async fn execute_user_command(
+        &mut self,
+        command: UserCommand,
+        ws_writer: &mut WsWriter,
+        ui: &mut TerminalUi,
+        invite_relay: &str,
+        invite_ttl: u32,
+        keys: &mut KeyManager,
+    ) -> Result<bool, Box<dyn Error>> {
+        match command {
             UserCommand::Ignore => Ok(true),
             UserCommand::Help => {
                 ui.print_line("Commands (basic):");
@@ -347,77 +367,29 @@ impl ClientRuntime {
             return Ok(());
         };
 
+        self.handle_wire_action_event(action, ws_writer, keys, ui)
+            .await
+    }
+
+    async fn handle_wire_action_event(
+        &mut self,
+        action: WireAction,
+        ws_writer: &mut WsWriter,
+        keys: &mut KeyManager,
+        ui: &mut TerminalUi,
+    ) -> Result<(), Box<dyn Error>> {
         match action {
             WireAction::SessionStarted { session_id } => {
-                self.secure_messenger.clear();
-                self.active_peer_trust = None;
-                self.active_peer_login = None;
-                self.resume_recovery_requested = false;
-                self.bootstrap.clear();
-
-                let resumed = self
-                    .try_auto_resume_on_session_start(session_id, ws_writer, ui)
+                self.handle_session_started(session_id, ws_writer, keys, ui)
                     .await?;
-                self.pending_resume_peer_ik = None;
-
-                if !resumed {
-                    handle_wire_action(
-                        WireAction::SessionStarted { session_id },
-                        ws_writer,
-                        &mut self.state,
-                        &mut self.bootstrap,
-                        keys,
-                        ui,
-                        &mut self.request_counter,
-                    )
-                    .await?;
-                }
             }
             WireAction::SessionEnded => {
-                self.secure_messenger.clear();
-                self.active_peer_trust = None;
-                self.active_peer_login = None;
-                self.pending_resume_peer_ik = None;
-                self.resume_recovery_requested = false;
-
-                handle_wire_action(
-                    WireAction::SessionEnded,
-                    ws_writer,
-                    &mut self.state,
-                    &mut self.bootstrap,
-                    keys,
-                    ui,
-                    &mut self.request_counter,
-                )
-                .await?;
+                self.reset_secure_runtime_state(true);
+                self.forward_wire_action(WireAction::SessionEnded, ws_writer, keys, ui)
+                    .await?;
             }
             WireAction::EncryptedMessage(event) => {
-                if !self.state.secure_active {
-                    if let Some(message) = self
-                        .try_auto_resume_from_incoming(&event, ws_writer, ui)
-                        .await?
-                    {
-                        let sender_label = self.incoming_sender_label();
-                        ui.print_line(&format!("{sender_label} {message}"));
-                        self.persist_active_session_checkpoint()?;
-                        return Ok(());
-                    }
-
-                    self.maybe_request_recovery_handshake(ws_writer, ui).await?;
-                    ui.print_error(
-                        "[e2e] secure session unavailable; waiting for recovery handshake",
-                    );
-                    return Ok(());
-                }
-
-                match self.secure_messenger.decrypt_incoming(&event) {
-                    Ok(message) => {
-                        let sender_label = self.incoming_sender_label();
-                        ui.print_line(&format!("{sender_label} {message}"));
-                        self.persist_active_session_checkpoint()?;
-                    }
-                    Err(err) => ui.print_error(&format!("[e2e] drop inbound message: {err}")),
-                }
+                self.handle_encrypted_message(event, ws_writer, ui).await?;
             }
             WireAction::LoginBound { request_id, event }
             | WireAction::LoginBinding { request_id, event } => {
@@ -427,65 +399,154 @@ impl ClientRuntime {
                 self.handle_error_event(request_id, event, ui);
             }
             action => {
-                handle_wire_action(
-                    action,
-                    ws_writer,
-                    &mut self.state,
-                    &mut self.bootstrap,
-                    keys,
-                    ui,
-                    &mut self.request_counter,
-                )
-                .await?;
-
-                if let Some(material) = self.bootstrap.take_secure_session_material() {
-                    if let Err(err) = self.secure_messenger.activate(&material) {
-                        ui.print_error(&format!(
-                            "[e2e] failed to activate secure messaging: {err}"
-                        ));
-                        self.state.secure_active = false;
-                    } else {
-                        let trust = self.trust.evaluate_peer(&material.peer_ik_ed25519)?;
-                        self.resume_recovery_requested = false;
-                        self.active_peer_login = None;
-                        self.print_active_trust(ui, &trust);
-
-                        if trust.state == SessionTrustState::KeyChanged {
-                            self.session_store
-                                .reset_for_local_identity(keys.identity_public_ed25519())?;
-                            let previous = trust
-                                .previous_fingerprint_short
-                                .as_deref()
-                                .unwrap_or("unknown");
-                            self.print_key_changed_warning(
-                                ui,
-                                previous,
-                                &trust.fingerprint_short,
-                                None,
-                            );
-                        } else {
-                            self.session_store.upsert(
-                                &material.peer_ik_ed25519,
-                                &material.root_key_b64u,
-                                0,
-                                0,
-                                material.established_unix,
-                            )?;
-                        }
-
-                        self.request_login_lookup_by_ik(
-                            ws_writer,
-                            &material.peer_ik_ed25519,
-                            false,
-                        )
-                        .await?;
-                        self.active_peer_trust = Some(trust);
-                    }
-                }
+                self.forward_wire_action(action, ws_writer, keys, ui)
+                    .await?;
+                self.activate_secure_material_if_ready(ws_writer, keys, ui)
+                    .await?;
             }
         }
 
         Ok(())
+    }
+
+    async fn handle_session_started(
+        &mut self,
+        session_id: uuid::Uuid,
+        ws_writer: &mut WsWriter,
+        keys: &mut KeyManager,
+        ui: &mut TerminalUi,
+    ) -> Result<(), Box<dyn Error>> {
+        self.reset_secure_runtime_state(false);
+        self.bootstrap.clear();
+
+        let resumed = self
+            .try_auto_resume_on_session_start(session_id, ws_writer, ui)
+            .await?;
+        self.pending_resume_peer_ik = None;
+
+        if !resumed {
+            self.forward_wire_action(
+                WireAction::SessionStarted { session_id },
+                ws_writer,
+                keys,
+                ui,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_encrypted_message(
+        &mut self,
+        event: E2eMsgRecvEvent,
+        ws_writer: &mut WsWriter,
+        ui: &mut TerminalUi,
+    ) -> Result<(), Box<dyn Error>> {
+        if !self.state.secure_active {
+            if let Some(message) = self
+                .try_auto_resume_from_incoming(&event, ws_writer, ui)
+                .await?
+            {
+                self.print_incoming_message(ui, &message);
+                self.persist_active_session_checkpoint()?;
+                return Ok(());
+            }
+
+            self.maybe_request_recovery_handshake(ws_writer, ui).await?;
+            ui.print_error("[e2e] secure session unavailable; waiting for recovery handshake");
+            return Ok(());
+        }
+
+        match self.secure_messenger.decrypt_incoming(&event) {
+            Ok(message) => {
+                self.print_incoming_message(ui, &message);
+                self.persist_active_session_checkpoint()?;
+            }
+            Err(err) => ui.print_error(&format!("[e2e] drop inbound message: {err}")),
+        }
+
+        Ok(())
+    }
+
+    async fn activate_secure_material_if_ready(
+        &mut self,
+        ws_writer: &mut WsWriter,
+        keys: &mut KeyManager,
+        ui: &mut TerminalUi,
+    ) -> Result<(), Box<dyn Error>> {
+        let Some(material) = self.bootstrap.take_secure_session_material() else {
+            return Ok(());
+        };
+
+        if let Err(err) = self.secure_messenger.activate(&material) {
+            ui.print_error(&format!("[e2e] failed to activate secure messaging: {err}"));
+            self.state.secure_active = false;
+            return Ok(());
+        }
+
+        let trust = self.trust.evaluate_peer(&material.peer_ik_ed25519)?;
+        self.resume_recovery_requested = false;
+        self.active_peer_login = None;
+        self.print_active_trust(ui, &trust);
+
+        if trust.state == SessionTrustState::KeyChanged {
+            self.session_store
+                .reset_for_local_identity(keys.identity_public_ed25519())?;
+            let previous = trust
+                .previous_fingerprint_short
+                .as_deref()
+                .unwrap_or("unknown");
+            self.print_key_changed_warning(ui, previous, &trust.fingerprint_short, None);
+        } else {
+            self.session_store.upsert(
+                &material.peer_ik_ed25519,
+                &material.root_key_b64u,
+                0,
+                0,
+                material.established_unix,
+            )?;
+        }
+
+        self.request_login_lookup_by_ik(ws_writer, &material.peer_ik_ed25519, false)
+            .await?;
+        self.active_peer_trust = Some(trust);
+
+        Ok(())
+    }
+
+    async fn forward_wire_action(
+        &mut self,
+        action: WireAction,
+        ws_writer: &mut WsWriter,
+        keys: &mut KeyManager,
+        ui: &mut TerminalUi,
+    ) -> Result<(), Box<dyn Error>> {
+        handle_wire_action(
+            action,
+            ws_writer,
+            &mut self.state,
+            &mut self.bootstrap,
+            keys,
+            ui,
+            &mut self.request_counter,
+        )
+        .await
+    }
+
+    fn print_incoming_message(&self, ui: &mut TerminalUi, message: &str) {
+        let sender_label = self.incoming_sender_label();
+        ui.print_line(&format!("{sender_label} {message}"));
+    }
+
+    fn reset_secure_runtime_state(&mut self, clear_pending_resume_peer: bool) {
+        self.secure_messenger.clear();
+        self.active_peer_trust = None;
+        self.active_peer_login = None;
+        self.resume_recovery_requested = false;
+        if clear_pending_resume_peer {
+            self.pending_resume_peer_ik = None;
+        }
     }
 
     pub async fn on_handshake_tick(
@@ -512,10 +573,7 @@ impl ClientRuntime {
             &mut self.request_counter,
         )
         .await?;
-        self.secure_messenger.clear();
-        self.active_peer_trust = None;
-        self.active_peer_login = None;
-        self.resume_recovery_requested = false;
+        self.reset_secure_runtime_state(false);
         Ok(())
     }
 
