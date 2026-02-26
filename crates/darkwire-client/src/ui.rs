@@ -1,17 +1,46 @@
 use crate::commands::command_palette_items;
 use crossterm::{
+    cursor::{Hide, MoveTo, Show},
     event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode, size},
+    queue,
+    style::{Color, Print, ResetColor, SetForegroundColor},
+    terminal::{disable_raw_mode, enable_raw_mode, size, Clear, ClearType},
 };
-use std::io::{self, Write};
+use std::{
+    collections::VecDeque,
+    io::{self, Write},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+const MAX_HISTORY_LINES: usize = 600;
+const MAX_COMMAND_MENU_ITEMS: usize = 4;
+const MIN_TERMINAL_WIDTH: usize = 28;
+const MIN_TERMINAL_HEIGHT: usize = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatLineKind {
+    Incoming,
+    Outgoing,
+    System,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct ChatLine {
+    timestamp: String,
+    sender: String,
+    text: String,
+    kind: ChatLineKind,
+}
 
 #[derive(Debug)]
 pub struct TerminalUi {
     interactive: bool,
     input_buffer: String,
-    rendered_prompt_rows: usize,
     command_matches: Vec<&'static str>,
     command_selected: usize,
+    history: VecDeque<ChatLine>,
+    active_peer: Option<String>,
 }
 
 impl TerminalUi {
@@ -19,17 +48,18 @@ impl TerminalUi {
         Self {
             interactive,
             input_buffer: String::new(),
-            rendered_prompt_rows: 0,
             command_matches: Vec::new(),
             command_selected: 0,
+            history: VecDeque::with_capacity(256),
+            active_peer: None,
         }
     }
 
     pub fn print_line(&mut self, line: &str) {
         if self.interactive {
-            self.clear_rendered_prompt();
-            println!("{line}");
-            self.redraw_prompt();
+            self.track_context_from_line(line, false);
+            self.push_history_line(line, false);
+            self.render();
             return;
         }
 
@@ -38,9 +68,9 @@ impl TerminalUi {
 
     pub fn print_error(&mut self, line: &str) {
         if self.interactive {
-            self.clear_rendered_prompt();
-            eprintln!("{line}");
-            self.redraw_prompt();
+            self.track_context_from_line(line, true);
+            self.push_history_line(line, true);
+            self.render();
             return;
         }
 
@@ -52,26 +82,7 @@ impl TerminalUi {
             return;
         }
 
-        self.clear_rendered_prompt();
-
-        let mut rendered_rows = 0;
-        if self.command_menu_visible() {
-            for (index, command) in self.command_matches.iter().enumerate() {
-                let line = if index == self.command_selected {
-                    format!("  > {command}")
-                } else {
-                    format!("    {command}")
-                };
-                print!("\r{line}\r\n");
-                rendered_rows += line_rows(&line);
-            }
-        }
-
-        // Always start prompt from column 0 even if cursor drifted after wrapped output.
-        print!("\r> {}", self.input_buffer);
-        let _ = io::stdout().flush();
-        rendered_rows += prompt_rows(&self.input_buffer);
-        self.rendered_prompt_rows = rendered_rows;
+        self.render();
     }
 
     pub fn clear_line(&mut self) {
@@ -79,8 +90,7 @@ impl TerminalUi {
             return;
         }
 
-        self.clear_rendered_prompt();
-        let _ = io::stdout().flush();
+        let _ = clear_screen_and_show_cursor();
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Option<String> {
@@ -96,28 +106,23 @@ impl TerminalUi {
 
                 let submitted = std::mem::take(&mut self.input_buffer);
                 self.update_command_matches();
-                print!("\r\n");
-                let _ = io::stdout().flush();
-                // Keep the submitted line in scrollback and draw a fresh prompt
-                // on the next line without trying to erase wrapped rows above.
-                self.rendered_prompt_rows = 0;
-                self.redraw_prompt();
+                self.render();
                 Some(submitted)
             }
             KeyCode::Backspace => {
                 self.input_buffer.pop();
                 self.update_command_matches();
-                self.redraw_prompt();
+                self.render();
                 None
             }
             KeyCode::Up => {
                 if self.command_menu_visible() {
                     if self.command_selected == 0 {
-                        self.command_selected = self.command_matches.len() - 1;
+                        self.command_selected = self.command_matches.len().saturating_sub(1);
                     } else {
                         self.command_selected -= 1;
                     }
-                    self.redraw_prompt();
+                    self.render();
                 }
                 None
             }
@@ -125,7 +130,7 @@ impl TerminalUi {
                 if self.command_menu_visible() {
                     self.command_selected =
                         (self.command_selected + 1) % self.command_matches.len();
-                    self.redraw_prompt();
+                    self.render();
                 }
                 None
             }
@@ -133,7 +138,7 @@ impl TerminalUi {
                 if self.command_menu_visible() {
                     self.command_matches.clear();
                     self.command_selected = 0;
-                    self.redraw_prompt();
+                    self.render();
                 }
                 None
             }
@@ -147,7 +152,7 @@ impl TerminalUi {
 
                 self.input_buffer.push(ch);
                 self.update_command_matches();
-                self.redraw_prompt();
+                self.render();
                 None
             }
             _ => None,
@@ -156,10 +161,7 @@ impl TerminalUi {
 
     pub fn handle_paste(&mut self, text: &str) {
         for ch in text.chars() {
-            if ch == '\r' || ch == '\n' {
-                continue;
-            }
-            if ch.is_control() {
+            if ch == '\r' || ch == '\n' || ch.is_control() {
                 continue;
             }
             self.input_buffer.push(ch);
@@ -167,7 +169,7 @@ impl TerminalUi {
 
         self.update_command_matches();
         if self.interactive {
-            self.redraw_prompt();
+            self.render();
         }
     }
 
@@ -207,21 +209,339 @@ impl TerminalUi {
 
         self.input_buffer = selected.to_string();
         self.update_command_matches();
-        self.redraw_prompt();
+        self.render();
         true
     }
 
-    fn clear_rendered_prompt(&mut self) {
-        if !self.interactive || self.rendered_prompt_rows == 0 {
+    fn track_context_from_line(&mut self, line: &str, _is_error: bool) {
+        if line.starts_with("[session:") && line.contains("ended") {
+            self.active_peer = None;
             return;
         }
 
-        print!("\r\x1b[2K");
-        for _ in 1..self.rendered_prompt_rows {
-            print!("\x1b[1A\r\x1b[2K");
+        if let Some(login) = parse_trust_login(line) {
+            self.active_peer = Some(login);
+            return;
         }
-        print!("\r");
-        self.rendered_prompt_rows = 0;
+
+        if let Some((sender, _)) = parse_sender_line(line) {
+            let sender = normalize_sender(&sender);
+            if !is_outgoing_sender(&sender) {
+                self.active_peer = Some(sender);
+            }
+        }
+    }
+
+    fn push_history_line(&mut self, line: &str, is_error: bool) {
+        let timestamp = hhmm_utc();
+
+        let entry = if let Some((sender, text)) = parse_sender_line(line) {
+            let sender = normalize_sender(&sender);
+            let kind = if is_outgoing_sender(&sender) {
+                ChatLineKind::Outgoing
+            } else {
+                ChatLineKind::Incoming
+            };
+            ChatLine {
+                timestamp,
+                sender,
+                text: text.to_string(),
+                kind,
+            }
+        } else {
+            ChatLine {
+                timestamp,
+                sender: if is_error {
+                    "err".to_string()
+                } else {
+                    "sys".to_string()
+                },
+                text: line.to_string(),
+                kind: if is_error {
+                    ChatLineKind::Error
+                } else {
+                    ChatLineKind::System
+                },
+            }
+        };
+
+        if self.history.len() >= MAX_HISTORY_LINES {
+            let _ = self.history.pop_front();
+        }
+        self.history.push_back(entry);
+    }
+
+    fn render(&mut self) {
+        if !self.interactive {
+            return;
+        }
+
+        let (cols, rows) = terminal_size();
+        if cols < MIN_TERMINAL_WIDTH || rows < MIN_TERMINAL_HEIGHT {
+            self.render_compact(cols);
+            return;
+        }
+
+        let inner = cols.saturating_sub(2);
+        let messages_height = rows.saturating_sub(6);
+
+        let mut stdout = io::stdout();
+        let _ = queue!(stdout, Hide, MoveTo(0, 0), Clear(ClearType::All));
+
+        let top_border = format!("╔{}╗", "═".repeat(inner));
+        let peers_sep = format!("╠{}╣", "═".repeat(inner));
+        let input_sep = peers_sep.clone();
+        let bottom_border = format!("╚{}╝", "═".repeat(inner));
+
+        let _ = queue!(stdout, MoveTo(0, 0), Print(top_border));
+        self.draw_peers_row(&mut stdout, 1, inner);
+        let _ = queue!(stdout, MoveTo(0, 2), Print(peers_sep));
+
+        self.draw_message_area(&mut stdout, 3, messages_height, inner);
+
+        let input_sep_y = rows.saturating_sub(3) as u16;
+        let input_y = rows.saturating_sub(2) as u16;
+        let bottom_y = rows.saturating_sub(1) as u16;
+
+        let _ = queue!(stdout, MoveTo(0, input_sep_y), Print(input_sep));
+        self.draw_input_row(&mut stdout, input_y, inner);
+        let _ = queue!(stdout, MoveTo(0, bottom_y), Print(bottom_border));
+
+        let input_prefix = " > ";
+        let available_input = inner.saturating_sub(input_prefix.chars().count());
+        let input_visible = tail_chars(&self.input_buffer, available_input);
+        let cursor_x = (1 + input_prefix.chars().count() + input_visible.chars().count()) as u16;
+        let _ = queue!(stdout, MoveTo(cursor_x, input_y), Show);
+        let _ = stdout.flush();
+    }
+
+    fn render_compact(&mut self, cols: usize) {
+        let mut stdout = io::stdout();
+        let visible = tail_chars(&self.input_buffer, cols.saturating_sub(3));
+        let _ = queue!(
+            stdout,
+            Hide,
+            MoveTo(0, 0),
+            Clear(ClearType::All),
+            Print("darkwire ui: terminal too small\r\n"),
+            Print(format!("> {visible}")),
+            Show,
+        );
+        let _ = stdout.flush();
+    }
+
+    fn draw_peers_row(&self, stdout: &mut io::Stdout, y: u16, inner: usize) {
+        let _ = queue!(stdout, MoveTo(0, y), Print("║"));
+
+        let prefix = " peers: ";
+        let _ = queue!(stdout, Print(prefix));
+        let mut used = prefix.chars().count();
+
+        let peer = self.active_peer.as_deref().unwrap_or("-");
+        let peer_visible = truncate_chars(peer, inner.saturating_sub(used));
+        let color = sender_color(peer);
+        if let Some(color) = color {
+            let _ = queue!(stdout, SetForegroundColor(color));
+        }
+        let _ = queue!(stdout, Print(&peer_visible), ResetColor);
+        used += peer_visible.chars().count();
+
+        if used < inner {
+            let _ = queue!(stdout, Print(" ".repeat(inner - used)));
+        }
+
+        let _ = queue!(stdout, Print("║"));
+    }
+
+    fn draw_message_area(
+        &self,
+        stdout: &mut io::Stdout,
+        start_y: usize,
+        height: usize,
+        inner: usize,
+    ) {
+        let menu_rows = if self.command_menu_visible() {
+            MAX_COMMAND_MENU_ITEMS.min(height.saturating_sub(1))
+        } else {
+            0
+        };
+        let history_rows = height.saturating_sub(menu_rows);
+
+        let mut y = start_y;
+
+        let lines: Vec<&ChatLine> = self
+            .history
+            .iter()
+            .rev()
+            .take(history_rows)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        for line in &lines {
+            self.draw_history_row(stdout, y as u16, inner, line);
+            y += 1;
+        }
+
+        while y < start_y + history_rows {
+            self.draw_blank_row(stdout, y as u16, inner);
+            y += 1;
+        }
+
+        if menu_rows > 0 {
+            let (start_idx, end_idx) =
+                command_menu_window(self.command_matches.len(), self.command_selected, menu_rows);
+
+            for (idx, command) in self.command_matches[start_idx..end_idx].iter().enumerate() {
+                let absolute_idx = start_idx + idx;
+                let selected = absolute_idx == self.command_selected;
+                self.draw_command_row(stdout, y as u16, inner, command, selected);
+                y += 1;
+            }
+
+            while y < start_y + height {
+                self.draw_blank_row(stdout, y as u16, inner);
+                y += 1;
+            }
+        }
+    }
+
+    fn draw_history_row(&self, stdout: &mut io::Stdout, y: u16, inner: usize, line: &ChatLine) {
+        let _ = queue!(stdout, MoveTo(0, y), Print("║"));
+
+        // Row shape: " HH:MM sender: message"
+        let sender_width = 10.min(inner.saturating_sub(10));
+        let header_width = 1 + 5 + 1 + sender_width + 2;
+        let body_width = inner.saturating_sub(header_width);
+
+        let mut used = 0;
+        let _ = queue!(stdout, Print(" "));
+        used += 1;
+
+        let time = pad_or_trim(&line.timestamp, 5);
+        let _ = queue!(
+            stdout,
+            SetForegroundColor(Color::DarkGrey),
+            Print(time),
+            ResetColor
+        );
+        used += 5;
+
+        let _ = queue!(stdout, Print(" "));
+        used += 1;
+
+        let sender = pad_or_trim(&line.sender, sender_width);
+        match line.kind {
+            ChatLineKind::System => {
+                let _ = queue!(stdout, SetForegroundColor(Color::DarkGrey));
+            }
+            ChatLineKind::Error => {
+                let _ = queue!(stdout, SetForegroundColor(Color::Red));
+            }
+            _ => {
+                if let Some(color) = sender_color(&line.sender) {
+                    let _ = queue!(stdout, SetForegroundColor(color));
+                }
+            }
+        }
+        let _ = queue!(stdout, Print(sender), ResetColor);
+        used += sender_width;
+
+        let _ = queue!(stdout, Print(": "));
+        used += 2;
+
+        let body = truncate_chars(&line.text, body_width);
+        match line.kind {
+            ChatLineKind::Error => {
+                let _ = queue!(
+                    stdout,
+                    SetForegroundColor(Color::Red),
+                    Print(&body),
+                    ResetColor
+                );
+            }
+            _ => {
+                let _ = queue!(stdout, Print(&body));
+            }
+        }
+        used += body.chars().count();
+
+        if used < inner {
+            let _ = queue!(stdout, Print(" ".repeat(inner - used)));
+        }
+
+        let _ = queue!(stdout, Print("║"));
+    }
+
+    fn draw_command_row(
+        &self,
+        stdout: &mut io::Stdout,
+        y: u16,
+        inner: usize,
+        command: &str,
+        selected: bool,
+    ) {
+        let _ = queue!(stdout, MoveTo(0, y), Print("║"));
+
+        let prefix = if selected { " / " } else { "   " };
+        let _ = queue!(stdout, Print(prefix));
+        let mut used = prefix.chars().count();
+
+        let available = inner.saturating_sub(used);
+        let text = truncate_chars(command, available);
+
+        if selected {
+            let _ = queue!(
+                stdout,
+                SetForegroundColor(Color::Cyan),
+                Print(text),
+                ResetColor
+            );
+        } else {
+            let _ = queue!(
+                stdout,
+                SetForegroundColor(Color::DarkGrey),
+                Print(text),
+                ResetColor
+            );
+        }
+        used += command.chars().count().min(available);
+
+        if used < inner {
+            let _ = queue!(stdout, Print(" ".repeat(inner - used)));
+        }
+
+        let _ = queue!(stdout, Print("║"));
+    }
+
+    fn draw_input_row(&self, stdout: &mut io::Stdout, y: u16, inner: usize) {
+        let _ = queue!(stdout, MoveTo(0, y), Print("║"));
+
+        let prefix = " > ";
+        let _ = queue!(stdout, Print(prefix));
+        let mut used = prefix.chars().count();
+
+        let available = inner.saturating_sub(used);
+        let input_visible = tail_chars(&self.input_buffer, available);
+        let _ = queue!(stdout, Print(&input_visible));
+        used += input_visible.chars().count();
+
+        if used < inner {
+            let _ = queue!(stdout, Print(" ".repeat(inner - used)));
+        }
+
+        let _ = queue!(stdout, Print("║"));
+    }
+
+    fn draw_blank_row(&self, stdout: &mut io::Stdout, y: u16, inner: usize) {
+        let _ = queue!(
+            stdout,
+            MoveTo(0, y),
+            Print("║"),
+            Print(" ".repeat(inner)),
+            Print("║")
+        );
     }
 }
 
@@ -234,6 +554,9 @@ impl RawModeGuard {
         }
 
         enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        queue!(stdout, Hide)?;
+        stdout.flush()?;
         Ok(Some(Self))
     }
 }
@@ -241,31 +564,162 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        print!("\r\x1b[2K");
-        let _ = io::stdout().flush();
+        let _ = clear_screen_and_show_cursor();
     }
 }
 
-fn prompt_rows(input: &str) -> usize {
-    let width = terminal_width();
-
-    let prompt_len = 2 + input.chars().count();
-    let used_cells = prompt_len.max(1);
-    ((used_cells - 1) / width) + 1
+fn clear_screen_and_show_cursor() -> io::Result<()> {
+    let mut stdout = io::stdout();
+    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All), Show)?;
+    stdout.flush()
 }
 
-fn line_rows(line: &str) -> usize {
-    let width = terminal_width();
-    let used_cells = line.chars().count().max(1);
-    ((used_cells - 1) / width) + 1
-}
-
-fn terminal_width() -> usize {
+fn terminal_size() -> (usize, usize) {
     size()
-        .map(|(cols, _)| cols as usize)
+        .map(|(cols, rows)| (cols as usize, rows as usize))
         .ok()
-        .filter(|cols| *cols > 0)
-        .unwrap_or(80)
+        .filter(|(cols, rows)| *cols > 0 && *rows > 0)
+        .unwrap_or((80, 24))
+}
+
+fn parse_sender_line(line: &str) -> Option<(String, &str)> {
+    if line.starts_with('[') {
+        return None;
+    }
+
+    let (sender, body) = line.split_once("> ")?;
+    if sender.is_empty() || sender.contains(' ') {
+        return None;
+    }
+
+    Some((sender.to_string(), body))
+}
+
+fn parse_trust_login(line: &str) -> Option<String> {
+    if !line.starts_with("[trust] state=") {
+        return None;
+    }
+
+    let login_key = " login=";
+    let start = line.find(login_key)? + login_key.len();
+    let value = line[start..].split_whitespace().next()?;
+    if value.is_empty() {
+        return None;
+    }
+
+    Some(value.to_string())
+}
+
+fn is_outgoing_sender(sender: &str) -> bool {
+    sender.eq_ignore_ascii_case("you") || sender.eq_ignore_ascii_case("me")
+}
+
+fn normalize_sender(sender: &str) -> String {
+    sender.trim().trim_end_matches('>').to_string()
+}
+
+fn sender_color(sender: &str) -> Option<Color> {
+    let normalized = sender.trim().trim_start_matches('@').to_ascii_lowercase();
+    match normalized.as_str() {
+        "mike" => Some(Color::Green),
+        "yura" => Some(Color::Blue),
+        "anna" => Some(Color::Magenta),
+        "bot" => Some(Color::Yellow),
+        "you" | "me" => Some(Color::Cyan),
+        "sys" => Some(Color::DarkGrey),
+        "err" => Some(Color::Red),
+        "peer" => Some(Color::White),
+        _ => color_from_name_hash(&normalized),
+    }
+}
+
+fn color_from_name_hash(value: &str) -> Option<Color> {
+    if value.is_empty() {
+        return None;
+    }
+
+    let mut hash = 2166136261_u32;
+    for byte in value.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16777619);
+    }
+
+    const PALETTE: &[Color] = &[
+        Color::Cyan,
+        Color::Green,
+        Color::Blue,
+        Color::Magenta,
+        Color::Yellow,
+        Color::White,
+    ];
+
+    Some(PALETTE[(hash as usize) % PALETTE.len()])
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut out = String::with_capacity(input.len().min(max_chars));
+    for ch in input.chars().take(max_chars) {
+        out.push(ch);
+    }
+    out
+}
+
+fn tail_chars(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let count = input.chars().count();
+    if count <= max_chars {
+        return input.to_string();
+    }
+
+    input.chars().skip(count - max_chars).collect()
+}
+
+fn pad_or_trim(input: &str, width: usize) -> String {
+    let trimmed = truncate_chars(input, width);
+    let len = trimmed.chars().count();
+    if len >= width {
+        return trimmed;
+    }
+
+    format!("{trimmed}{}", " ".repeat(width - len))
+}
+
+fn hhmm_utc() -> String {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let day_secs = now_secs % 86_400;
+    let hours = day_secs / 3_600;
+    let mins = (day_secs % 3_600) / 60;
+    format!("{hours:02}:{mins:02}")
+}
+
+fn command_menu_window(total: usize, selected: usize, max_rows: usize) -> (usize, usize) {
+    if total == 0 || max_rows == 0 {
+        return (0, 0);
+    }
+    if total <= max_rows {
+        return (0, total);
+    }
+
+    let half = max_rows / 2;
+    let mut start = selected.saturating_sub(half);
+    let mut end = start + max_rows;
+    if end > total {
+        end = total;
+        start = end.saturating_sub(max_rows);
+    }
+
+    (start, end)
 }
 
 #[cfg(test)]
@@ -364,10 +818,24 @@ mod tests {
     }
 
     #[test]
-    fn prompt_rows_scales_with_length() {
-        let short = prompt_rows("hi");
-        let long = prompt_rows(&"x".repeat(500));
-        assert!(short >= 1);
-        assert!(long >= short);
+    fn parse_sender_line_recognizes_chat_labels_only() {
+        assert_eq!(
+            parse_sender_line("@mike> hello"),
+            Some(("@mike".to_string(), "hello"))
+        );
+        assert!(parse_sender_line("[ready:cli-1] server_time=1").is_none());
+    }
+
+    #[test]
+    fn command_menu_window_keeps_selected_in_view() {
+        let (start, end) = command_menu_window(10, 8, 4);
+        assert!(8 >= start && 8 < end);
+        assert_eq!(end - start, 4);
+    }
+
+    #[test]
+    fn tail_chars_keeps_end_of_long_input() {
+        assert_eq!(tail_chars("abcdef", 3), "def");
+        assert_eq!(tail_chars("abc", 5), "abc");
     }
 }
