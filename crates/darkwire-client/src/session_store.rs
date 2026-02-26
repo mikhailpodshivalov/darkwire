@@ -9,7 +9,8 @@ use std::{
 };
 
 const SESSION_STORE_VERSION: u32 = 1;
-const DEFAULT_SESSION_FILE: &str = "sessions.json";
+const DEFAULT_KEY_STEM: &str = "keys";
+const SESSION_FILE_SUFFIX: &str = "sessions.json";
 
 #[derive(Debug, Clone)]
 pub struct StoredSession {
@@ -216,11 +217,16 @@ impl SessionRecord {
 }
 
 pub fn default_session_store_path(key_file: &Path) -> PathBuf {
-    key_file
+    let parent = key_file
         .parent()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(DEFAULT_SESSION_FILE)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = key_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(DEFAULT_KEY_STEM);
+    parent.join(format!("{stem}.{SESSION_FILE_SUFFIX}"))
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), Box<dyn Error>> {
@@ -432,6 +438,18 @@ mod tests {
             session_file
                 .parent()
                 .expect("temp session file should have a parent"),
+        );
+    }
+
+    #[test]
+    fn default_session_store_path_is_keyfile_scoped() {
+        assert_eq!(
+            default_session_store_path(Path::new("/tmp/keys-a.json")),
+            PathBuf::from("/tmp/keys-a.sessions.json")
+        );
+        assert_eq!(
+            default_session_store_path(Path::new("keys.json")),
+            PathBuf::from("keys.sessions.json")
         );
     }
 }
